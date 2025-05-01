@@ -42,128 +42,81 @@ def create_db_connection():
 
 
 def create_tables():
-    """Creates the users and file_transfers tables if they don't exist."""
+    """Creates necessary database tables if they don't exist."""
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
         try:
-            # Create users table with role field
+            # Create users table
             cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                username VARCHAR(50) UNIQUE NOT NULL,
-                password VARCHAR(255) NOT NULL,
-                public_key TEXT NOT NULL,
-                role VARCHAR(20) DEFAULT 'regular' NOT NULL
-            )
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(50) UNIQUE NOT NULL,
+                    password VARCHAR(255) NOT NULL,
+                    public_key TEXT NOT NULL,
+                    role VARCHAR(20) NOT NULL DEFAULT 'regular'
+                )
             """)
-
+            
             # Create permissions table
             cursor.execute("""
-            CREATE TABLE IF NOT EXISTS permissions (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(50) UNIQUE NOT NULL,
-                description TEXT
-            )
+                CREATE TABLE IF NOT EXISTS permissions (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(50) UNIQUE NOT NULL
+                )
             """)
+            
+            # Insert default permissions if table is empty
+            cursor.execute("SELECT COUNT(*) FROM permissions")
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("""
+                    INSERT INTO permissions (name) VALUES 
+                    ('read'), ('write'), ('manage_users'), ('manage_files')
+                """)
             
             # Create user_permissions table
             cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_permissions (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NOT NULL,
-                permission_id INT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY (permission_id) REFERENCES permissions(id) ON DELETE CASCADE,
-                UNIQUE KEY unique_user_permission (user_id, permission_id)
-            )
+                CREATE TABLE IF NOT EXISTS user_permissions (
+                    user_id INT NOT NULL,
+                    permission_id INT NOT NULL,
+                    PRIMARY KEY (user_id, permission_id),
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    FOREIGN KEY (permission_id) REFERENCES permissions(id)
+                )
             """)
-
-            # Create file_permissions table
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS file_permissions (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                file_id INT NOT NULL,
-                user_id INT,
-                permission_type ENUM('read', 'write', 'manage') NOT NULL,
-                is_public BOOLEAN DEFAULT FALSE,
-                FOREIGN KEY (file_id) REFERENCES file_transfers(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                UNIQUE KEY unique_file_user_permission (file_id, user_id, permission_type)
-            )
-            """)
-
-            # Create file_transfers table with original_hash column for integrity verification
+            
+            # Create file_transfers table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS file_transfers (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     sender_id INT NOT NULL,
                     recipient_id INT NOT NULL,
                     filename VARCHAR(255) NOT NULL,
+                    file_size INT NOT NULL,
                     transfer_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    file_size BIGINT,
-                    status VARCHAR(50),
+                    status VARCHAR(20) NOT NULL,
                     encrypted_key TEXT NOT NULL,
-                    original_hash VARCHAR(64),
+                    original_hash TEXT,
                     FOREIGN KEY (sender_id) REFERENCES users(id),
                     FOREIGN KEY (recipient_id) REFERENCES users(id)
                 )
             """)
             
-            # Add original_hash column if it doesn't exist (for existing installations)
-            try:
-                cursor.execute("""
-                    ALTER TABLE file_transfers ADD COLUMN IF NOT EXISTS original_hash VARCHAR(64)
-                """)
-            except mysql.Error:
-                # If the database doesn't support IF NOT EXISTS for ADD COLUMN
-                cursor.execute("""
-                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS 
-                    WHERE TABLE_NAME = 'file_transfers' AND COLUMN_NAME = 'original_hash'
-                """)
-                if cursor.fetchone()[0] == 0:
-                    cursor.execute("""
-                        ALTER TABLE file_transfers ADD COLUMN original_hash VARCHAR(64)
-                    """)
-                
-            # Add role column to users table if it doesn't exist (for existing installations)
-            try:
-                cursor.execute("""
-                    ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'regular' NOT NULL
-                """)
-            except mysql.Error:
-                # If the database doesn't support IF NOT EXISTS for ADD COLUMN
-                cursor.execute("""
-                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS 
-                    WHERE TABLE_NAME = 'users' AND COLUMN_NAME = 'role'
-                """)
-                if cursor.fetchone()[0] == 0:
-                    cursor.execute("""
-                        ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'regular' NOT NULL
-                    """)
-            
-            # Insert default permissions if they don't exist
-            cursor.execute("SELECT COUNT(*) FROM permissions")
-            if cursor.fetchone()[0] == 0:
-                permissions = [
-                    ("read", "Permission to read/download files"),
-                    ("write", "Permission to write/upload files"),
-                    ("manage_users", "Permission to manage users and their permissions"),
-                    ("manage_files", "Permission to manage files and their permissions")
-                ]
-                cursor.executemany(
-                    "INSERT INTO permissions (name, description) VALUES (%s, %s)",
-                    permissions
+            # Create file_permissions table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS file_permissions (
+                    file_id INT NOT NULL,
+                    user_id INT,
+                    permission_type VARCHAR(20) NOT NULL,
+                    is_public BOOLEAN DEFAULT FALSE,
+                    FOREIGN KEY (file_id) REFERENCES file_transfers(id),
+                    FOREIGN KEY (user_id) REFERENCES users(id)
                 )
-                
-            # Make the first user an admin if users table is empty
-            cursor.execute("SELECT COUNT(*) FROM users")
-            if cursor.fetchone()[0] == 0:
-                log_activity("No users found. The first registered user will be assigned as admin.")
-                    
+            """)
+            
             mydb.commit()
-            log_activity("Database tables verified and updated if needed")
-        except mysql.Error as err:
+            log_activity("Database tables verified and created if needed")
+        except Exception as err:
             log_activity(f"Error creating database tables: {err}")
         finally:
             cursor.close()
@@ -1344,20 +1297,25 @@ def handle_client(client_socket, client_address):
 # --- Server Startup ---
 def start_server():
     """Starts the file transfer server."""
-    create_tables()
+    # Create socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
     try:
         server_socket.bind((SERVER_HOST, SERVER_PORT))
         server_socket.listen(5)
         log_activity(f"Server listening on {SERVER_HOST}:{SERVER_PORT}")
-
+        
+        # Initialize database tables
+        create_tables()
+        
         while True:
             client_socket, client_address = server_socket.accept()
             client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
+            client_thread.daemon = True
             client_thread.start()
-
-    except socket.error as e:
-        log_activity(f"Socket error: {e}")
+    except Exception as e:
+        log_activity(f"Server error: {e}")
     finally:
         server_socket.close()
         log_activity("Server socket closed.")
