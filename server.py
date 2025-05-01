@@ -165,22 +165,19 @@ def create_tables():
             mydb.close()
 
 
-def register_user(username, password, client_public_key, requested_role=None, admin_password=None):
+def register_user(username, password, client_public_key, requested_role=None, requester_id=None):
     """Registers a new user in the database.
     
     Args:
-        username (str): Username for the new user
-        password (str): Password for the new user
-        client_public_key (str): Public key in PEM format
-        requested_role (str, optional): Requested user role ('admin' or 'regular')
-        admin_password (str, optional): Admin password for verification when registering as admin
+        username (str): The username to register
+        password (str): The password to hash and store
+        client_public_key (str): The client's public key in PEM format
+        requested_role (str, optional): The requested role ('admin' or 'regular')
+        requester_id (int, optional): The ID of the user making the request
         
     Returns:
         bool: True if registration successful, False otherwise
     """
-    # Admin password for verification - in a real system, this would be stored securely
-    ADMIN_PASSWORD = "secure_admin_password"
-    
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
@@ -189,28 +186,37 @@ def register_user(username, password, client_public_key, requested_role=None, ad
             cursor.execute("SELECT COUNT(*) FROM users")
             is_first_user = cursor.fetchone()[0] == 0
             
-            hashed_password = hashlib.sha256(password.encode()).hexdigest()
+            # Default role is regular
+            role = 'regular'
             
-            # Determine role
-            if is_first_user:
-                # First user is always admin
+            # If admin role requested, validate requester has permission
+            if requested_role == 'admin':
+                # First user can be admin
+                if is_first_user:
+                    role = 'admin'
+                # Otherwise, check if requester is an admin
+                elif requester_id:
+                    cursor.execute("SELECT role FROM users WHERE id = %s", (requester_id,))
+                    requester_role = cursor.fetchone()
+                    if requester_role and requester_role[0] == 'admin':
+                        role = 'admin'
+                    else:
+                        log_activity(f"Attempt to create admin user '{username}' by non-admin user ID {requester_id}")
+                        return False
+                else:
+                    log_activity(f"Unauthorized attempt to create admin user '{username}'")
+                    return False
+            # First user is always admin regardless of requested role
+            elif is_first_user:
                 role = 'admin'
-                log_activity(f"First user '{username}' being registered as administrator")
-            elif requested_role == 'admin' and admin_password == ADMIN_PASSWORD:
-                # Allow admin registration with correct password
-                role = 'admin'
-                log_activity(f"New admin user '{username}' being registered with admin password")
-            else:
-                # Default or invalid admin registration request
-                role = 'regular'
-                if requested_role == 'admin':
-                    log_activity(f"Admin registration for '{username}' rejected: Invalid admin password")
+                
+            hashed_password = hashlib.sha256(password.encode()).hexdigest()
             
             cursor.execute("INSERT INTO users (username, password, public_key, role) VALUES (%s, %s, %s, %s)",
                            (username, hashed_password, client_public_key, role))
             user_id = cursor.lastrowid
             
-            # If it's an admin user, give them all permissions
+            # If role is admin, give all permissions
             if role == 'admin':
                 # Get all permission IDs
                 cursor.execute("SELECT id FROM permissions")
@@ -704,16 +710,23 @@ def handle_client(client_socket, client_address):
                         username = request.get('username')
                         password = request.get('password')
                         client_public_key = request.get('public_key')
-                        requested_role = request.get('role')
-                        admin_password = request.get('admin_password')
+                        requested_role = request.get('role', 'regular')
                         
-                        if username and password:
-                            if register_user(username, password, client_public_key, requested_role, admin_password):
+                        if username and password and client_public_key:
+                            # Get requester ID if logged in (for admin registration)
+                            requester_id = None
+                            if logged_in_user:
+                                requester_id = get_user_id(logged_in_user)
+                                
+                            if register_user(username, password, client_public_key, requested_role, requester_id):
                                 response = {'status': 'success', 'message': 'Registration successful'}
                             else:
-                                response = {'status': 'error', 'message': 'Username already exists'}
+                                if requested_role == 'admin':
+                                    response = {'status': 'error', 'message': 'Registration failed: Not authorized to create admin account'}
+                                else:
+                                    response = {'status': 'error', 'message': 'Registration failed: Username already exists'}
                         else:
-                            response = {'status': 'error', 'message': 'Username and password are required'}
+                            response = {'status': 'error', 'message': 'Username, password and public key are required'}
                         client_socket.send(json.dumps(response).encode(ENCODING))
                         log_activity(f"Sent response to {client_address}: {response}")
 

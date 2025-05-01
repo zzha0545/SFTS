@@ -172,24 +172,12 @@ class FileTransferClientGUI:
         
         # Add role selection
         ttk.Label(reg_group, text="Role:").grid(row=2, column=0, padx=5, pady=5, sticky='w')
-        self.reg_role_combobox = ttk.Combobox(reg_group, values=('regular', 'admin'), state='readonly')
-        self.reg_role_combobox.current(0)  # Default to 'regular'
+        self.reg_role_combobox = ttk.Combobox(reg_group, values=["regular", "admin"], state="readonly")
+        self.reg_role_combobox.current(0)  # Default to regular user
         self.reg_role_combobox.grid(row=2, column=1, padx=5, pady=5, sticky='ew')
-        
-        # Add admin password field (hidden initially)
-        self.admin_pw_frame = ttk.Frame(reg_group)
-        self.admin_pw_frame.grid(row=3, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
-        self.admin_pw_frame.grid_remove()  # Hide initially
-        
-        ttk.Label(self.admin_pw_frame, text="Admin Password:").pack(side='left', padx=5)
-        self.admin_password_entry = ttk.Entry(self.admin_pw_frame, show="*")
-        self.admin_password_entry.pack(side='left', padx=5, fill='x', expand=True)
-        
-        # Add callback for role selection change
-        self.reg_role_combobox.bind('<<ComboboxSelected>>', self.on_role_change)
 
         reg_button = ttk.Button(reg_group, text="Register", command=self.register)
-        reg_button.grid(row=4, column=0, columnspan=2, padx=5, pady=10, sticky='ew')
+        reg_button.grid(row=3, column=0, columnspan=2, padx=5, pady=10, sticky='ew')
 
         # --- Login ---
         login_group = ttk.LabelFrame(self.auth_frame, text="Login")
@@ -308,113 +296,75 @@ class FileTransferClientGUI:
 
         return None  # 🚨 If the socket is not initialized, return None
 
-    def on_role_change(self, event):
-        """Show or hide the admin password field based on selected role."""
-        selected_role = self.reg_role_combobox.get()
-        if selected_role == 'admin':
-            self.admin_pw_frame.grid()  # Show admin password field
-        else:
-            self.admin_pw_frame.grid_remove()  # Hide admin password field
-            
     def register(self):
         username = self.reg_username_entry.get()
         password = self.reg_password_entry.get()
         role = self.reg_role_combobox.get()
-        
-        # Validate inputs
-        if not username or not password:
-            messagebox.showerror("Error", "Username and password are required")
-            return
-            
-        # Check admin password if registering as admin
-        if role == 'admin':
-            admin_password = self.admin_password_entry.get()
-            if not admin_password:
-                messagebox.showerror("Error", "Admin password is required for admin registration")
+
+        if username and password and role:
+            # Check if trying to register as admin without being admin
+            if role == "admin" and (not self.logged_in or self.user_role != "admin"):
+                messagebox.showerror("Permission Denied", "Only administrators can register new admin accounts")
                 return
-            
-            # This is a simple check - in a real system, this would be more secure
-            # For security reasons, you should have a more robust admin password verification
-            ADMIN_PASSWORD = "secure_admin_password"  # In a real system, this would be stored securely
-            if admin_password != ADMIN_PASSWORD:
-                messagebox.showerror("Error", "Invalid admin password")
-                return
+                
+            # Generate RSA key pair locally on the client
+            private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048
+            )
+            public_key = private_key.public_key()
 
-        # Generate RSA key pair locally on the client
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048
-        )
-        public_key = private_key.public_key()
+            # Convert public key to PEM format
+            public_pem = public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode()
 
-        # Convert public key to PEM format
-        public_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode()
+            # Convert private key to PEM format
+            private_pem = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
 
-        # Convert private key to PEM format
-        private_pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        )
+            # Generate a salt
+            salt = os.urandom(16)
+            salt_encoded = base64.urlsafe_b64encode(salt).decode()
 
-        # Generate a salt
-        salt = os.urandom(16)
-        salt_encoded = base64.urlsafe_b64encode(salt).decode()
+            # Derive encryption key from the user's password and salt
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=100000,
+            )
+            derived_key = kdf.derive(password.encode())
 
-        # Derive encryption key from the user's password and salt
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-        )
-        derived_key = kdf.derive(password.encode())
+            # Generate an initialization vector (IV) for AES encryption
+            iv = os.urandom(16)
 
-        # Generate an initialization vector (IV) for AES encryption
-        iv = os.urandom(16)
+            # Encrypt the private key using AES-256-CBC
+            cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv))
+            encryptor = cipher.encryptor()
 
-        # Encrypt the private key using AES-256-CBC
-        cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv))
-        encryptor = cipher.encryptor()
+            # Ensure private key length is a multiple of 16 (for AES)
+            padded_private_key = private_pem + (b"\0" * (16 - len(private_pem) % 16))
+            encrypted_private_key = encryptor.update(padded_private_key) + encryptor.finalize()
 
-        # Ensure private key length is a multiple of 16 (for AES)
-        padded_private_key = private_pem + (b"\0" * (16 - len(private_pem) % 16))
-        encrypted_private_key = encryptor.update(padded_private_key) + encryptor.finalize()
+            # Store encrypted private key locally in Base64 format
+            with open(f"{username}_private.enc", "w") as f:
+                f.write(f"{salt_encoded}:{base64.b64encode(iv).decode()}:{base64.b64encode(encrypted_private_key).decode()}")
 
-        # Store encrypted private key locally in Base64 format
-        with open(f"{username}_private.enc", "w") as f:
-            f.write(f"{salt_encoded}:{base64.b64encode(iv).decode()}:{base64.b64encode(encrypted_private_key).decode()}")
-
-        # Send public key to the server for storage
-        request = {
-            'action': 'register', 
-            'username': username, 
-            'password': password, 
-            'public_key': public_pem,
-            'role': role
-        }
-        
-        # If registering as admin, include admin password in request
-        if role == 'admin':
-            request['admin_password'] = admin_password
-            
-        if self.send_request(request):
-            response = self.receive_response()
-            if response and response.get('status') == 'success':
-                messagebox.showinfo("Success", "User registered successfully!")
-                # Clear fields after successful registration
-                self.reg_username_entry.delete(0, tk.END)
-                self.reg_password_entry.delete(0, tk.END)
-                self.reg_role_combobox.current(0)  # Reset to regular
-                self.admin_password_entry.delete(0, tk.END)
-                self.admin_pw_frame.grid_remove()  # Hide admin password field
-            else:
-                messagebox.showerror("Error", response.get('message', "Registration failed."))
+            # Send public key to the server for storage
+            request = {'action': 'register', 'username': username, 'password': password, 'public_key': public_pem, 'role': role}
+            if self.send_request(request):
+                response = self.receive_response()
+                if response and response.get('status') == 'success':
+                    messagebox.showinfo("Success", "User registered successfully!")
+                else:
+                    messagebox.showerror("Error", response.get('message', "Registration failed."))
         else:
-            messagebox.showerror("Error", "Failed to communicate with server.")
+            messagebox.showerror("Error", "All fields are required.")
 
     def login(self):
         username = self.login_username_entry.get()
@@ -639,7 +589,7 @@ class FileTransferClientGUI:
         try:
             # Create download directory if it doesn't exist
             os.makedirs("downloads", exist_ok=True)
-        
+            
             # Prompt user for download location
             download_path = filedialog.asksaveasfilename(
                 initialdir="downloads",
@@ -649,117 +599,126 @@ class FileTransferClientGUI:
             )
             
             if not download_path:
-                # User cancelled
-            return
-            
+                return  # User cancelled
+                
             # Request file from server
             request = {'action': 'download_file', 'filename': filename}
-            if self.send_request(request):
-        response = self.receive_response()
-                
-                if response and response.get('status') == 'error':
-                    # Handle permission error
-                    if "permission" in response.get('message', '').lower():
-                        messagebox.showerror("Permission Denied", 
-                            "You don't have permission to download this file. Please contact the file owner.")
-                    else:
-                        messagebox.showerror("Download Error", response.get('message', "Failed to download file"))
-            return
-            
-                if response and response.get('status') == 'success':
-        try:
-                        # Get file size and symmetric key
-            file_size = response.get('file_size')
-            encrypted_key_hex = response.get('encrypted_key')
-                        original_hash = response.get('original_hash')  # For integrity verification
-                        
-                        # Convert encrypted key from hex back to bytes
-                        encrypted_key = bytes.fromhex(encrypted_key_hex)
-                        
-                        # Load private key from disk
-                        with open(f"{self.logged_in_user}_private.enc", "r") as f:
-                            encrypted_private_key_data = f.read()
-                            
-                        # Ask for password to decrypt the private key
-                        password = askstring("Password Required", "Enter your password to decrypt the file:", show='*')
-                        if not password:
-                            return  # User cancelled
-                            
-                        # Decrypt private key
-                        private_key = decrypt_private_key(encrypted_private_key_data, password)
-                        if not private_key:
-                            messagebox.showerror("Decryption Error", "Failed to decrypt your private key. Incorrect password?")
-                            return
-                            
-                        # Decrypt symmetric key with private key
-                        try:
-                            symmetric_key = private_key.decrypt(
-                                encrypted_key,
-                                padding.OAEP(
-                                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                                    algorithm=hashes.SHA256(),
-                                    label=None
-                                )
-                            )
-                        except Exception as e:
-                            messagebox.showerror("Decryption Error", f"Failed to decrypt file key: {e}")
-                            return
-                        
-                        # Set a timeout for receiving the file
-                        self.client_socket.settimeout(60)  # 60-second timeout
-                        
-                        try:
-            # Receive encrypted file data
-                            self.status_label.config(text=f"Downloading file ({file_size} bytes)...")
-                            
-            received_data = b""
-            bytes_received = 0
-            
-                while bytes_received < file_size:
-                    chunk = self.client_socket.recv(BUFFER_SIZE)
-                    if not chunk:
-                                    break
-                    received_data += chunk
-                    bytes_received += len(chunk)
-            finally:
-                # Reset socket timeout
-                self.client_socket.settimeout(None)
-                
-                        # Verify received size
-            if bytes_received != file_size:
-                            messagebox.showerror("Download Error", f"Incomplete file: received {bytes_received}/{file_size} bytes")
+            if not self.send_request(request):
                 return
                 
-                        # Decrypt file with symmetric key
-            try:
-                            fernet = Fernet(symmetric_key)
-                decrypted_data = fernet.decrypt(received_data)
+            response = self.receive_response()
+            
+            if not response:
+                messagebox.showerror("Error", "No response from server")
+                return
                 
-                            # Verify integrity if hash was provided
-            if original_hash:
-                hash_obj = hashlib.sha256()
-                hash_obj.update(decrypted_data)
-                calculated_hash = hash_obj.hexdigest()
-                
-                if calculated_hash != original_hash:
-                                    messagebox.showerror("Integrity Error", 
-                                        "File hash verification failed! The file may have been tampered with.")
-                                    # Continue anyway but warn the user
-                    
-            # Save the decrypted file
-                            with open(download_path, 'wb') as f:
-                        f.write(decrypted_data)
-                                
-                            messagebox.showinfo("Success", f"File downloaded and decrypted successfully to {download_path}")
-                            self.status_label.config(style="Green.TLabel", text=f"File downloaded: {filename}")
-                except Exception as e:
-                            messagebox.showerror("Decryption Error", f"Failed to decrypt file: {e}")
-                
-        except Exception as e:
-                        messagebox.showerror("Download Error", f"Error during download: {e}")
-                        self.status_label.config(style="Red.TLabel", text=f"Download error: {e}")
+            if response.get('status') == 'error':
+                # Handle permission error
+                if "permission" in response.get('message', '').lower():
+                    messagebox.showerror("Permission Denied", 
+                        "You don't have permission to download this file. Please contact the file owner.")
                 else:
-                    messagebox.showerror("Error", "Failed to download file")
+                    messagebox.showerror("Download Error", response.get('message', "Failed to download file"))
+                return
+            
+            if response.get('status') == 'success':
+                try:
+                    # Get file size and symmetric key
+                    file_size = response.get('file_size')
+                    encrypted_key_hex = response.get('encrypted_key')
+                    original_hash = response.get('original_hash')  # For integrity verification
+                    
+                    if not file_size or not encrypted_key_hex:
+                        messagebox.showerror("Error", "Missing file metadata in server response")
+                        return
+                    
+                    # Convert encrypted key from hex back to bytes
+                    encrypted_key = bytes.fromhex(encrypted_key_hex)
+                    
+                    # Load private key from disk
+                    with open(f"{self.logged_in_user}_private.enc", "r") as f:
+                        encrypted_private_key_data = f.read()
+                        
+                    # Ask for password to decrypt the private key
+                    password = askstring("Password Required", "Enter your password to decrypt the file:", show='*')
+                    if not password:
+                        return  # User cancelled
+                        
+                    # Decrypt private key
+                    private_key = decrypt_private_key(encrypted_private_key_data, password)
+                    if not private_key:
+                        messagebox.showerror("Decryption Error", "Failed to decrypt your private key. Incorrect password?")
+                        return
+                        
+                    # Decrypt symmetric key with private key
+                    try:
+                        symmetric_key = private_key.decrypt(
+                            encrypted_key,
+                            padding.OAEP(
+                                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                algorithm=hashes.SHA256(),
+                                label=None
+                            )
+                        )
+                    except Exception as e:
+                        messagebox.showerror("Decryption Error", f"Failed to decrypt file key: {e}")
+                        return
+                    
+                    # Set a timeout for receiving the file
+                    self.client_socket.settimeout(60)  # 60-second timeout
+                    
+                    try:
+                        # Receive encrypted file data
+                        self.status_label.config(text=f"Downloading file ({file_size} bytes)...")
+                        
+                        received_data = b""
+                        bytes_received = 0
+                        
+                        while bytes_received < file_size:
+                            chunk = self.client_socket.recv(BUFFER_SIZE)
+                            if not chunk:
+                                break
+                            received_data += chunk
+                            bytes_received += len(chunk)
+                    finally:
+                        # Reset socket timeout
+                        self.client_socket.settimeout(None)
+                    
+                    # Verify received size
+                    if bytes_received != file_size:
+                        messagebox.showerror("Download Error", f"Incomplete file: received {bytes_received}/{file_size} bytes")
+                        return
+                    
+                    # Decrypt file with symmetric key
+                    try:
+                        fernet = Fernet(symmetric_key)
+                        decrypted_data = fernet.decrypt(received_data)
+                        
+                        # Verify integrity if hash was provided
+                        if original_hash:
+                            hash_obj = hashlib.sha256()
+                            hash_obj.update(decrypted_data)
+                            calculated_hash = hash_obj.hexdigest()
+                            
+                            if calculated_hash != original_hash:
+                                messagebox.showerror("Integrity Error", 
+                                    "File hash verification failed! The file may have been tampered with.")
+                                # Continue anyway but warn the user
+                        
+                        # Save the decrypted file
+                        with open(download_path, 'wb') as f:
+                            f.write(decrypted_data)
+                            
+                        messagebox.showinfo("Success", f"File downloaded and decrypted successfully to {download_path}")
+                        self.status_label.config(style="Green.TLabel", text=f"File downloaded: {filename}")
+                    except Exception as e:
+                        messagebox.showerror("Decryption Error", f"Failed to decrypt file: {e}")
+                        
+                except Exception as e:
+                    messagebox.showerror("Download Error", f"Error during download: {e}")
+                    self.status_label.config(style="Red.TLabel", text=f"Download error: {e}")
+            else:
+                messagebox.showerror("Error", "Failed to download file")
         except Exception as e:
             messagebox.showerror("Error", f"Unexpected error: {e}")
             self.status_label.config(style="Red.TLabel", text=f"Error: {e}")
