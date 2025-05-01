@@ -12,11 +12,19 @@ import json
 import os
 import base64
 import hashlib
+import time
 
 SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 ENCODING = 'utf-8'
+
+DATABASE_CONFIG = {
+    'host': 'localhost',
+    'user': 'sfts_user',
+    'password': 'Wzy020618',
+    'database': 'secure_file_transfer'
+}
 
 def decrypt_private_key(encrypted_private_key_data, password):
     """Decrypts an encrypted private RSA key using the user's password with enhanced error handling."""
@@ -124,12 +132,42 @@ class FileTransferClientGUI:
 
     def connect_server(self):
         try:
+            # 创建新的socket连接
+            if self.client_socket:
+                try:
+                    self.client_socket.close()
+                except:
+                    pass
+                    
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.client_socket.connect((SERVER_HOST, SERVER_PORT))
-            self.status_label.config(style="Green.TLabel", text=f"Connected to server at {SERVER_HOST}:{SERVER_PORT}")
-        except socket.error as e:
-            self.status_label.config(style="Red.TLabel", text=f"Error connecting to server: {e}")
-            messagebox.showerror("Connection Error", f"Could not connect to the server: {e}")
+            self.client_socket.settimeout(5.0)  # 设置连接超时
+            
+            # 尝试连接，最多重试3次
+            max_retries = 3
+            retry_count = 0
+            connected = False
+            
+            while retry_count < max_retries and not connected:
+                try:
+                    self.client_socket.connect((SERVER_HOST, SERVER_PORT))
+                    connected = True
+                    self.status_label.config(style="Green.TLabel", text=f"Connected to server at {SERVER_HOST}:{SERVER_PORT}")
+                except socket.error as e:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        self.status_label.config(style="Red.TLabel", text=f"Connection attempt {retry_count} failed, retrying...")
+                        time.sleep(1)  # 等待1秒后重试
+                    else:
+                        self.status_label.config(style="Red.TLabel", text=f"Error connecting to server after {max_retries} attempts: {e}")
+                        messagebox.showerror("Connection Error", f"Could not connect to the server after {max_retries} attempts: {e}")
+            
+            # 连接成功后恢复无限等待
+            if connected:
+                self.client_socket.settimeout(None)
+                
+        except Exception as e:
+            self.status_label.config(style="Red.TLabel", text=f"Unexpected error: {e}")
+            messagebox.showerror("Connection Error", f"Unexpected error: {e}")
 
     def create_widgets(self):
         self.notebook = ttk.Notebook(self.master)
@@ -269,45 +307,163 @@ class FileTransferClientGUI:
 
     def receive_response(self):
         """Receives and parses a complete JSON response from the server."""
-        if self.client_socket:
+        if not self.client_socket:
+            return None
+            
+        try:
+            data = b""
+            # Use the existing timeout if set by caller
+            current_timeout = self.client_socket.gettimeout()
+            
+            # Set maximum receive size to prevent infinite loops
+            max_data_size = BUFFER_SIZE * 10  # 10x buffer size
+            
             try:
-                data = b""
-                while True:  # Keep receiving until the full JSON response is received
-                    chunk = self.client_socket.recv(BUFFER_SIZE)
-                    if not chunk:
-                        break  # Stop if connection is closed
-                    data += chunk
+                start_time = datetime.now()
+                while True:
                     try:
-                        response = json.loads(data.decode(ENCODING))  # Try parsing JSON
-                        return response  # ✅ If successful, return parsed JSON
+                        chunk = self.client_socket.recv(BUFFER_SIZE)
+                    except socket.timeout:
+                        # If timeout but we have data, try to parse it
+                        if data:
+                            try:
+                                return json.loads(data.decode(ENCODING))
+                            except json.JSONDecodeError:
+                                # Can't parse, timeout is an error
+                                break
+                        else:
+                            # No data received before timeout
+                            raise
+                    
+                    if not chunk:
+                        break  # Connection closed
+                        
+                    data += chunk
+                    
+                    try:
+                        # Try to parse JSON
+                        response = json.loads(data.decode(ENCODING))
+                        return response
                     except json.JSONDecodeError:
-                        continue  # Keep receiving until we have a full JSON message
+                        # Check if we've received too much data
+                        if len(data) > max_data_size:
+                            print(f"Receive buffer too large: {len(data)} bytes")
+                            self.status_label.config(style="Red.TLabel", text="Received invalid response format")
+                            return None
+                            
+                        # Check if it's taking too long
+                        elapsed = (datetime.now() - start_time).total_seconds()
+                        if elapsed > 10:  # 10-second receive timeout
+                            print(f"Receive timeout: {elapsed} seconds")
+                            self.status_label.config(style="Red.TLabel", text="Response timeout")
+                            return None
+                            
+                        # Continue receiving data
+                        continue
+            
+            except socket.timeout:
+                self.status_label.config(style="Red.TLabel", text="Server response timeout")
+                print("Socket timeout waiting for response")
+                return None
+            
+            # If loop ended normally but no data
+            if not data:
+                self.status_label.config(style="Red.TLabel", text="No server response")
+                return None
                 
-                # If we exit the loop without valid JSON, it means we got an incomplete response
-                self.status_label.config(style="Red.TLabel", text="Server response incomplete.")
-                messagebox.showerror("Error", "Incomplete response from server.")
+            # Try one final parse
+            try:
+                return json.loads(data.decode(ENCODING))
+            except json.JSONDecodeError:
+                self.status_label.config(style="Red.TLabel", text="Invalid response format")
+                print(f"Could not parse received data: {data[:100]}...")
                 return None
-
-            except socket.error as e:
-                print(f"Socket error: {e}")  # ✅ Debugging step
-                self.status_label.config(style="Red.TLabel", text="Error receiving response.")
-                messagebox.showerror("Connection Error", "Connection lost.")
-                return None
-
-        return None  # 🚨 If the socket is not initialized, return None
+                
+        except socket.error as e:
+            self.status_label.config(style="Red.TLabel", text=f"Connection error: {e}")
+            print(f"Socket error: {e}")
+            return None
+        finally:
+            # Restore previous timeout setting
+            if current_timeout != self.client_socket.gettimeout():
+                try:
+                    self.client_socket.settimeout(current_timeout)
+                except:
+                    pass
 
     def register(self):
-        username = self.reg_username_entry.get()
+        username = self.reg_username_entry.get().strip()  # Remove leading/trailing spaces
         password = self.reg_password_entry.get()
         role = self.reg_role_combobox.get()
 
-        if username and password and role:
-            # Check if trying to register as admin without being admin
-            if role == "admin" and (not self.logged_in or self.user_role != "admin"):
-                messagebox.showerror("Permission Denied", "Only administrators can register new admin accounts")
+        # Validate input
+        if not username or not password or not role:
+            messagebox.showerror("Error", "All fields are required")
+            return
+            
+        # Validate username format
+        if not username.isalnum():
+            messagebox.showerror("Error", "Username must contain only letters and numbers")
+            self.reg_username_entry.delete(0, tk.END)
+            return
+
+        # Check if trying to register admin without permission
+        if role == "admin" and (not self.logged_in or self.user_role != "admin"):
+            messagebox.showerror("Permission Denied", "Only administrators can register new admin accounts")
+            return
+        
+        # First check if username exists
+        try:
+            # Clear any data in socket buffer
+            try:
+                self.client_socket.settimeout(0.1)
+                while True:
+                    data = self.client_socket.recv(BUFFER_SIZE)
+                    if not data:
+                        break
+            except (socket.timeout, socket.error):
+                pass
+            finally:
+                self.client_socket.settimeout(None)
+                
+            # Send username check request
+            check_request = {'action': 'check_username', 'username': username}
+            if not self.send_request(check_request):
+                messagebox.showerror("Error", "Could not send username check request")
                 return
                 
-            # Generate RSA key pair locally on the client
+            self.client_socket.settimeout(5.0)  # 5-second timeout for response
+            try:
+                response = self.receive_response()
+                if response and response.get('status') == 'success':
+                    # If username exists, show error and return
+                    if response.get('exists', False):
+                        messagebox.showerror("Error", "Username already exists, please choose another")
+                        self.reg_username_entry.delete(0, tk.END)
+                        return
+                elif response and response.get('status') == 'error' and 'Invalid action' in response.get('message', ''):
+                    # Server doesn't support username check, continue with registration
+                    print("Server doesn't support username check, proceeding with registration")
+                else:
+                    # Some other error occurred
+                    error_msg = response.get('message', "Username check failed") if response else "No response from server"
+                    print(f"Username check error: {error_msg}")
+                    # Continue with registration as a fallback
+            except socket.timeout:
+                print("Timeout during username check")
+                # Continue with registration as a fallback
+            except Exception as e:
+                print(f"Error during username check: {e}")
+                # Continue with registration as a fallback
+            finally:
+                self.client_socket.settimeout(None)
+                
+        except Exception as e:
+            print(f"Username check error: {e}")
+            # Continue with registration attempt
+            
+        # Generate RSA key pair
+        try:
             private_key = rsa.generate_private_key(
                 public_exponent=65537,
                 key_size=2048
@@ -327,11 +483,11 @@ class FileTransferClientGUI:
                 encryption_algorithm=serialization.NoEncryption()
             )
 
-            # Generate a salt
+            # Generate salt
             salt = os.urandom(16)
             salt_encoded = base64.urlsafe_b64encode(salt).decode()
 
-            # Derive encryption key from the user's password and salt
+            # Derive encryption key from password and salt
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
@@ -340,31 +496,101 @@ class FileTransferClientGUI:
             )
             derived_key = kdf.derive(password.encode())
 
-            # Generate an initialization vector (IV) for AES encryption
+            # Generate initialization vector for AES encryption
             iv = os.urandom(16)
 
-            # Encrypt the private key using AES-256-CBC
+            # Encrypt private key using AES-256-CBC
             cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv))
             encryptor = cipher.encryptor()
 
-            # Ensure private key length is a multiple of 16 (for AES)
+            # Ensure private key length is a multiple of 16 (AES requirement)
             padded_private_key = private_pem + (b"\0" * (16 - len(private_pem) % 16))
             encrypted_private_key = encryptor.update(padded_private_key) + encryptor.finalize()
 
-            # Store encrypted private key locally in Base64 format
-            with open(f"{username}_private.enc", "w") as f:
-                f.write(f"{salt_encoded}:{base64.b64encode(iv).decode()}:{base64.b64encode(encrypted_private_key).decode()}")
+            # Store encrypted private key locally (Base64 format)
+            private_key_file = f"{username}_private.enc"
+            try:
+                with open(private_key_file, "w") as f:
+                    f.write(f"{salt_encoded}:{base64.b64encode(iv).decode()}:{base64.b64encode(encrypted_private_key).decode()}")
+            except IOError as e:
+                messagebox.showerror("Error", f"Could not save private key file: {e}")
+                return
+                
+            # Clear socket buffer again before registration request
+            try:
+                self.client_socket.settimeout(0.1)
+                while True:
+                    data = self.client_socket.recv(BUFFER_SIZE)
+                    if not data:
+                        break
+            except (socket.timeout, socket.error):
+                pass
+            finally:
+                self.client_socket.settimeout(None)
 
-            # Send public key to the server for storage
+            # Send registration request
             request = {'action': 'register', 'username': username, 'password': password, 'public_key': public_pem, 'role': role}
-            if self.send_request(request):
+            if not self.send_request(request):
+                # Delete the created private key file since registration failed
+                try:
+                    os.remove(private_key_file)
+                except:
+                    pass
+                messagebox.showerror("Error", "Could not send registration request")
+                return
+                
+            # Wait for response with timeout
+            self.client_socket.settimeout(5.0)
+            try:
                 response = self.receive_response()
+                self.client_socket.settimeout(None)
+                
                 if response and response.get('status') == 'success':
                     messagebox.showinfo("Success", "User registered successfully!")
+                    # Clear registration form
+                    self.reg_username_entry.delete(0, tk.END)
+                    self.reg_password_entry.delete(0, tk.END)
+                    self.reg_role_combobox.current(0)  # Reset to "regular"
                 else:
-                    messagebox.showerror("Error", response.get('message', "Registration failed."))
-        else:
-            messagebox.showerror("Error", "All fields are required.")
+                    # Handle error cases
+                    error_msg = response.get('message', "Registration failed") if response else "No server response"
+                    
+                    # If username already exists, clean up and prompt user to try again with different name
+                    if response and "username already exists" in error_msg.lower():
+                        # Delete the created private key file since registration failed
+                        try:
+                            os.remove(private_key_file)
+                        except:
+                            pass
+                        self.reg_username_entry.delete(0, tk.END)
+                        messagebox.showerror("Error", "Username already exists, please choose another")
+                    else:
+                        # Delete the created private key file for other errors too
+                        try:
+                            os.remove(private_key_file)
+                        except:
+                            pass
+                        messagebox.showerror("Error", error_msg)
+                        
+            except socket.timeout:
+                self.client_socket.settimeout(None)
+                # Delete the created private key file since registration failed
+                try:
+                    os.remove(private_key_file)
+                except:
+                    pass
+                messagebox.showerror("Error", "Server response timeout, please try again")
+            except Exception as e:
+                self.client_socket.settimeout(None)
+                # Delete the created private key file since registration failed
+                try:
+                    os.remove(private_key_file)
+                except:
+                    pass
+                messagebox.showerror("Error", f"Error receiving server response: {e}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error during registration: {e}")
+            print(f"Registration error details: {e}")
 
     def login(self):
         username = self.login_username_entry.get()

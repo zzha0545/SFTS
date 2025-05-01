@@ -2,7 +2,7 @@ import socket
 import threading
 import os
 import hashlib
-import mysql.connector
+import pymysql as mysql
 import json
 from datetime import datetime
 
@@ -11,8 +11,8 @@ SERVER_HOST = '0.0.0.0'
 SERVER_PORT = 5001
 DATABASE_CONFIG = {
     'host': 'localhost',
-    'user': 'root',
-    'password': 'root',
+    'user': 'sfts_user',
+    'password': 'Wzy020618',
     'database': 'secure_file_transfer'
 }
 BUFFER_SIZE = 65536
@@ -28,10 +28,15 @@ def log_activity(message):
 def create_db_connection():
     """Creates and returns a MySQL database connection."""
     try:
-        mydb = mysql.connector.connect(**DATABASE_CONFIG)
+        mydb = mysql.connect(
+            host=DATABASE_CONFIG['host'],
+            user=DATABASE_CONFIG['user'],
+            password=DATABASE_CONFIG['password'],
+            database=DATABASE_CONFIG['database']
+        )
         log_activity("Database connection established.")
         return mydb
-    except mysql.connector.Error as err:
+    except Exception as err:
         log_activity(f"Error connecting to MySQL: {err}")
         return None
 
@@ -110,7 +115,7 @@ def create_tables():
                 cursor.execute("""
                     ALTER TABLE file_transfers ADD COLUMN IF NOT EXISTS original_hash VARCHAR(64)
                 """)
-            except mysql.connector.Error:
+            except mysql.Error:
                 # If the database doesn't support IF NOT EXISTS for ADD COLUMN
                 cursor.execute("""
                     SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS 
@@ -126,7 +131,7 @@ def create_tables():
                 cursor.execute("""
                     ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'regular' NOT NULL
                 """)
-            except mysql.connector.Error:
+            except mysql.Error:
                 # If the database doesn't support IF NOT EXISTS for ADD COLUMN
                 cursor.execute("""
                     SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS 
@@ -158,11 +163,38 @@ def create_tables():
                     
             mydb.commit()
             log_activity("Database tables verified and updated if needed")
-        except mysql.connector.Error as err:
+        except mysql.Error as err:
             log_activity(f"Error creating database tables: {err}")
         finally:
             cursor.close()
             mydb.close()
+
+
+def check_username_exists(username):
+    """Check if a username already exists in the database.
+    
+    Args:
+        username (str): The username to check
+        
+    Returns:
+        bool: True if username exists, False otherwise
+    """
+    mydb = create_db_connection()
+    if mydb:
+        cursor = mydb.cursor()
+        try:
+            # Use row lock when checking usernames
+            cursor.execute("SELECT COUNT(*) FROM users WHERE username = %s FOR UPDATE", (username,))
+            count = cursor.fetchone()[0]
+            cursor.close()
+            mydb.close()
+            return count > 0
+        except Exception as err:
+            log_activity(f"Error checking username existence: {err}")
+            cursor.close()
+            mydb.close()
+            return False
+    return False
 
 
 def register_user(username, password, client_public_key, requested_role=None, requester_id=None):
@@ -179,80 +211,106 @@ def register_user(username, password, client_public_key, requested_role=None, re
         bool: True if registration successful, False otherwise
     """
     mydb = create_db_connection()
-    if mydb:
-        cursor = mydb.cursor()
-        try:
-            # Check if this is the first user
-            cursor.execute("SELECT COUNT(*) FROM users")
-            is_first_user = cursor.fetchone()[0] == 0
-            
-            # Default role is regular
-            role = 'regular'
-            
-            # If admin role requested, validate requester has permission
-            if requested_role == 'admin':
-                # First user can be admin
-                if is_first_user:
-                    role = 'admin'
-                # Otherwise, check if requester is an admin
-                elif requester_id:
-                    cursor.execute("SELECT role FROM users WHERE id = %s", (requester_id,))
-                    requester_role = cursor.fetchone()
-                    if requester_role and requester_role[0] == 'admin':
-                        role = 'admin'
-                    else:
-                        log_activity(f"Attempt to create admin user '{username}' by non-admin user ID {requester_id}")
-                        return False
-                else:
-                    log_activity(f"Unauthorized attempt to create admin user '{username}'")
-                    return False
-            # First user is always admin regardless of requested role
-            elif is_first_user:
-                role = 'admin'
-                
-            hashed_password = hashlib.sha256(password.encode()).hexdigest()
-            
-            cursor.execute("INSERT INTO users (username, password, public_key, role) VALUES (%s, %s, %s, %s)",
-                           (username, hashed_password, client_public_key, role))
-            user_id = cursor.lastrowid
-            
-            # If role is admin, give all permissions
-            if role == 'admin':
-                # Get all permission IDs
-                cursor.execute("SELECT id FROM permissions")
-                permissions = cursor.fetchall()
-                
-                # Assign all permissions to admin
-                for perm_id in permissions:
-                    cursor.execute("INSERT INTO user_permissions (user_id, permission_id) VALUES (%s, %s)",
-                                  (user_id, perm_id[0]))
-                
-                log_activity(f"User '{username}' registered as administrator with all permissions.")
-            else:
-                # Give regular users basic read and write permissions by default
-                cursor.execute("SELECT id FROM permissions WHERE name IN ('read', 'write')")
-                basic_permissions = cursor.fetchall()
-                
-                for perm_id in basic_permissions:
-                    cursor.execute("INSERT INTO user_permissions (user_id, permission_id) VALUES (%s, %s)",
-                                  (user_id, perm_id[0]))
-                
-                log_activity(f"User '{username}' registered with basic permissions.")
-            
-            mydb.commit()
-            cursor.close()
-            mydb.close()
-            return True
-        except mysql.connector.IntegrityError:
-            cursor.close()
-            mydb.close()
+    if not mydb:
+        log_activity(f"Registration failed: Database connection error")
+        return False
+        
+    cursor = mydb.cursor()
+    try:
+        # Start transaction
+        mydb.begin()
+        
+        # Check if username exists with a row lock
+        cursor.execute("SELECT COUNT(*) FROM users WHERE username = %s FOR UPDATE", (username,))
+        if cursor.fetchone()[0] > 0:
             log_activity(f"Registration failed: Username '{username}' already exists.")
-            return False  # Username already exists
-        except mysql.connector.Error as err:
-            log_activity(f"Error registering user '{username}': {err}")
+            mydb.rollback()
             cursor.close()
             mydb.close()
-            return False
+            return False  # Username already exists
+    
+        # Check if this is the first user
+        cursor.execute("SELECT COUNT(*) FROM users")
+        is_first_user = cursor.fetchone()[0] == 0
+        
+        # Default role is regular
+        role = 'regular'
+        
+        # If admin role requested, validate requester has permission
+        if requested_role == 'admin':
+            # First user can be admin
+            if is_first_user:
+                role = 'admin'
+            # Otherwise, check if requester is an admin
+            elif requester_id:
+                cursor.execute("SELECT role FROM users WHERE id = %s", (requester_id,))
+                requester_role = cursor.fetchone()
+                if requester_role and requester_role[0] == 'admin':
+                    role = 'admin'
+                else:
+                    log_activity(f"Attempt to create admin user '{username}' by non-admin user ID {requester_id}")
+                    mydb.rollback()
+                    cursor.close()
+                    mydb.close()
+                    return False
+            else:
+                log_activity(f"Unauthorized attempt to create admin user '{username}'")
+                mydb.rollback()
+                cursor.close()
+                mydb.close() 
+                return False
+        # First user is always admin regardless of requested role
+        elif is_first_user:
+            role = 'admin'
+            
+        hashed_password = hashlib.sha256(password.encode()).hexdigest()
+        
+        cursor.execute("INSERT INTO users (username, password, public_key, role) VALUES (%s, %s, %s, %s)",
+                      (username, hashed_password, client_public_key, role))
+        user_id = cursor.lastrowid
+        
+        # If role is admin, give all permissions
+        if role == 'admin':
+            # Get all permission IDs
+            cursor.execute("SELECT id FROM permissions")
+            permissions = cursor.fetchall()
+            
+            # Assign all permissions to admin
+            for perm_id in permissions:
+                cursor.execute("INSERT INTO user_permissions (user_id, permission_id) VALUES (%s, %s)",
+                              (user_id, perm_id[0]))
+            
+            log_activity(f"User '{username}' registered as administrator with all permissions.")
+        else:
+            # Give regular users basic read and write permissions by default
+            cursor.execute("SELECT id FROM permissions WHERE name IN ('read', 'write')")
+            basic_permissions = cursor.fetchall()
+            
+            for perm_id in basic_permissions:
+                cursor.execute("INSERT INTO user_permissions (user_id, permission_id) VALUES (%s, %s)",
+                              (user_id, perm_id[0]))
+            
+            log_activity(f"User '{username}' registered with basic permissions.")
+        
+        # Commit the transaction
+        mydb.commit()
+        cursor.close()
+        mydb.close()
+        return True
+    except mysql.IntegrityError as err:
+        # Roll back in case of error
+        mydb.rollback()
+        log_activity(f"Registration failed: Database integrity error: {err}")
+        cursor.close()
+        mydb.close()
+        return False  # Username already exists or other integrity error
+    except Exception as err:
+        # Roll back in case of error
+        mydb.rollback()
+        log_activity(f"Error registering user '{username}': {err}")
+        cursor.close()
+        mydb.close()
+        return False
 
 
 def login_user(username, password):
@@ -268,27 +326,34 @@ def login_user(username, password):
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
-        cursor.execute("SELECT id, password, role FROM users WHERE username = %s", (username,))
-        result = cursor.fetchone()
-        cursor.close()
-        mydb.close()
-        if result:
-            user_id, stored_password, role = result
-            hashed_password = hashlib.sha256(password.encode()).hexdigest()
-            if hashed_password == stored_password:
-                log_activity(f"User '{username}' logged in successfully.")
-                # Return user information including role
-                return {
-                    'id': user_id,
-                    'username': username,
-                    'role': role
-                }
+        try:
+            cursor.execute("SELECT id, password, role FROM users WHERE username = %s", (username,))
+            result = cursor.fetchone()
+            cursor.close()
+            mydb.close()
+            if result:
+                user_id, stored_password, role = result
+                hashed_password = hashlib.sha256(password.encode()).hexdigest()
+                if hashed_password == stored_password:
+                    log_activity(f"User '{username}' logged in successfully.")
+                    # Return user information including role
+                    return {
+                        'id': user_id,
+                        'username': username,
+                        'role': role
+                    }
+                else:
+                    log_activity(f"Login failed for user '{username}': Incorrect password.")
+                    return False
             else:
-                log_activity(f"Login failed for user '{username}': Incorrect password.")
+                log_activity(f"Login failed: User '{username}' not found.")
                 return False
-        else:
-            log_activity(f"Login failed: User '{username}' not found.")
+        except Exception as err:
+            log_activity(f"Error during login: {err}")
+            cursor.close()
+            mydb.close()
             return False
+    return False
 
 
 def get_user_public_key(username):
@@ -296,13 +361,20 @@ def get_user_public_key(username):
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
-        cursor.execute("SELECT public_key FROM users WHERE username = %s", (username,))
-        result = cursor.fetchone()
-        cursor.close()
-        mydb.close()
-        if result:
-            return result[0]  # Public key in PEM format
-        return None
+        try:
+            cursor.execute("SELECT public_key FROM users WHERE username = %s", (username,))
+            result = cursor.fetchone()
+            cursor.close()
+            mydb.close()
+            if result:
+                return result[0]  # Public key in PEM format
+            return None
+        except Exception as err:
+            log_activity(f"Error retrieving public key: {err}")
+            cursor.close()
+            mydb.close()
+            return None
+    return None
 
 
 def get_user_id(username):
@@ -310,15 +382,22 @@ def get_user_id(username):
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
-        cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
-        result = cursor.fetchone()
-        cursor.close()
-        mydb.close()
-        if result:
-            return result[0]
-        else:
-            log_activity(f"Could not retrieve ID for user '{username}'.")
+        try:
+            cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+            result = cursor.fetchone()
+            cursor.close()
+            mydb.close()
+            if result:
+                return result[0]
+            else:
+                log_activity(f"Could not retrieve ID for user '{username}'.")
+                return None
+        except Exception as err:
+            log_activity(f"Error retrieving user ID: {err}")
+            cursor.close()
+            mydb.close()
             return None
+    return None
 
 
 def get_username_by_id(user_id):
@@ -326,15 +405,22 @@ def get_username_by_id(user_id):
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
-        cursor.execute("SELECT username FROM users WHERE id = %s", (user_id,))
-        result = cursor.fetchone()
-        cursor.close()
-        mydb.close()
-        if result:
-            return result[0]
-        else:
-            log_activity(f"Could not retrieve username for ID '{user_id}'.")
+        try:
+            cursor.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            mydb.close()
+            if result:
+                return result[0]
+            else:
+                log_activity(f"Could not retrieve username for ID '{user_id}'.")
+                return None
+        except Exception as err:
+            log_activity(f"Error retrieving username: {err}")
+            cursor.close()
+            mydb.close()
             return None
+    return None
 
 
 def get_user_role(user_id):
@@ -342,15 +428,22 @@ def get_user_role(user_id):
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
-        cursor.execute("SELECT role FROM users WHERE id = %s", (user_id,))
-        result = cursor.fetchone()
-        cursor.close()
-        mydb.close()
-        if result:
-            return result[0]
-        else:
-            log_activity(f"Could not retrieve role for user ID '{user_id}'.")
+        try:
+            cursor.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            mydb.close()
+            if result:
+                return result[0]
+            else:
+                log_activity(f"Could not retrieve role for user ID '{user_id}'.")
+                return None
+        except Exception as err:
+            log_activity(f"Error retrieving user role: {err}")
+            cursor.close()
+            mydb.close()
             return None
+    return None
 
 
 def check_user_permission(user_id, permission_name):
@@ -387,7 +480,7 @@ def check_user_permission(user_id, permission_name):
             cursor.close()
             mydb.close()
             return has_permission
-        except mysql.connector.Error as err:
+        except Exception as err:
             log_activity(f"Error checking permission '{permission_name}' for user ID '{user_id}': {err}")
             cursor.close()
             mydb.close()
@@ -400,29 +493,35 @@ def get_transfer_history(user_id):
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
-        cursor.execute("""
-            SELECT ft.filename, s.username AS sender, r.username AS recipient, ft.transfer_time, ft.file_size, ft.status
-            FROM file_transfers ft
-            JOIN users s ON ft.sender_id = s.id
-            JOIN users r ON ft.recipient_id = r.id
-            WHERE ft.sender_id = %s OR ft.recipient_id = %s
-            ORDER BY ft.transfer_time DESC
-        """, (user_id, user_id))
-        history = cursor.fetchall()
-        cursor.close()
-        mydb.close()
-        history_data = []
-        for row in history:
-            history_data.append({
-                'filename': row[0],
-                'sender': row[1],
-                'recipient': row[2],
-                'transfer_time': str(row[3]),
-                'file_size': row[4],
-                'status': row[5]
-            })
-        log_activity(f"Retrieved transfer history for user ID '{user_id}'. Found {len(history_data)} records.")
-        return history_data
+        try:
+            cursor.execute("""
+                SELECT ft.filename, s.username AS sender, r.username AS recipient, ft.transfer_time, ft.file_size, ft.status
+                FROM file_transfers ft
+                JOIN users s ON ft.sender_id = s.id
+                JOIN users r ON ft.recipient_id = r.id
+                WHERE ft.sender_id = %s OR ft.recipient_id = %s
+                ORDER BY ft.transfer_time DESC
+            """, (user_id, user_id))
+            history = cursor.fetchall()
+            cursor.close()
+            mydb.close()
+            history_data = []
+            for row in history:
+                history_data.append({
+                    'filename': row[0],
+                    'sender': row[1],
+                    'recipient': row[2],
+                    'transfer_time': str(row[3]),
+                    'file_size': row[4],
+                    'status': row[5]
+                })
+            log_activity(f"Retrieved transfer history for user ID '{user_id}'. Found {len(history_data)} records.")
+            return history_data
+        except Exception as err:
+            log_activity(f"Error retrieving transfer history: {err}")
+            cursor.close()
+            mydb.close()
+            return None
     else:
         log_activity(f"Failed to retrieve transfer history for user ID '{user_id}' due to database error.")
         return None
@@ -459,7 +558,7 @@ def get_file_id(filename, user_id=None):
             else:
                 log_activity(f"Could not find file ID for filename '{filename}'")
                 return None
-        except mysql.connector.Error as err:
+        except Exception as err:
             log_activity(f"Database error retrieving file ID: {err}")
             cursor.close()
             mydb.close()
@@ -533,7 +632,7 @@ def check_file_permission(file_id, user_id, permission_type):
             mydb.close()
             return has_permission
             
-        except mysql.connector.Error as err:
+        except Exception as err:
             log_activity(f"Error checking file permission: {err}")
             cursor.close()
             mydb.close()
@@ -592,7 +691,7 @@ def set_file_permission(file_id, user_id, permission_type, target_user_id=None, 
                 
             return True
             
-        except mysql.connector.Error as err:
+        except Exception as err:
             log_activity(f"Error setting file permission: {err}")
             cursor.close()
             mydb.close()
@@ -645,7 +744,7 @@ def remove_file_permission(file_id, user_id, permission_type, target_user_id=Non
                 
             return True
             
-        except mysql.connector.Error as err:
+        except Exception as err:
             log_activity(f"Error removing file permission: {err}")
             cursor.close()
             mydb.close()
@@ -677,7 +776,7 @@ def get_all_users():
                 })
             
             return users
-        except mysql.connector.Error as err:
+        except Exception as err:
             log_activity(f"Error retrieving users: {err}")
             cursor.close()
             mydb.close()
@@ -706,7 +805,17 @@ def handle_client(client_socket, client_address):
                     log_activity(
                         f"Received action '{action}' from {client_address} (User: {logged_in_user if logged_in_user else 'N/A'}). Request details: {request}")
 
-                    if action == 'register':
+                    if action == 'check_username':
+                        username = request.get('username')
+                        if username:
+                            exists = check_username_exists(username)
+                            response = {'status': 'success', 'exists': exists}
+                        else:
+                            response = {'status': 'error', 'message': 'Username parameter is required'}
+                        client_socket.send(json.dumps(response).encode(ENCODING))
+                        log_activity(f"Sent username check response to {client_address}: {response}")
+                        
+                    elif action == 'register':
                         username = request.get('username')
                         password = request.get('password')
                         client_public_key = request.get('public_key')
@@ -875,7 +984,7 @@ def handle_client(client_socket, client_address):
                                     
                                     mydb.commit()
                                     log_activity(f"Initial file permissions set for file ID {file_id}")
-                                except mysql.connector.Error as err:
+                                except Exception as err:
                                     log_activity(f"Database error: {err}")
                                     raise Exception(f"Database error: {err}")
                                 finally:
@@ -962,7 +1071,7 @@ def handle_client(client_socket, client_address):
                                     WHERE filename = %s AND recipient_id = (SELECT id FROM users WHERE username = %s)
                                 """, (filename, recipient_username))
                                 result = cursor.fetchone()
-                            except mysql.connector.Error as err:
+                            except Exception as err:
                                 log_activity(f"Database error: {err}")
                                 response = {'status': 'error', 'message': f'Database error: {str(err)}'}
                                 client_socket.send(json.dumps(response).encode(ENCODING))
@@ -1184,7 +1293,7 @@ def handle_client(client_socket, client_address):
                                 
                                 response = {'status': 'success', 'permissions': permissions_data}
                                 
-                            except mysql.connector.Error as err:
+                            except Exception as err:
                                 log_activity(f"Database error getting file permissions: {err}")
                                 response = {'status': 'error', 'message': 'Database error'}
                                 cursor.close()
