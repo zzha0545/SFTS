@@ -42,13 +42,49 @@ def create_tables():
     if mydb:
         cursor = mydb.cursor()
         try:
-            # Create users table
+            # Create users table with role field
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 username VARCHAR(50) UNIQUE NOT NULL,
                 password VARCHAR(255) NOT NULL,
-                public_key TEXT NOT NULL
+                public_key TEXT NOT NULL,
+                role VARCHAR(20) DEFAULT 'regular' NOT NULL
+            )
+            """)
+
+            # Create permissions table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS permissions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(50) UNIQUE NOT NULL,
+                description TEXT
+            )
+            """)
+            
+            # Create user_permissions table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_permissions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                permission_id INT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (permission_id) REFERENCES permissions(id) ON DELETE CASCADE,
+                UNIQUE KEY unique_user_permission (user_id, permission_id)
+            )
+            """)
+
+            # Create file_permissions table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS file_permissions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                file_id INT NOT NULL,
+                user_id INT,
+                permission_type ENUM('read', 'write', 'manage') NOT NULL,
+                is_public BOOLEAN DEFAULT FALSE,
+                FOREIGN KEY (file_id) REFERENCES file_transfers(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE KEY unique_file_user_permission (file_id, user_id, permission_type)
             )
             """)
 
@@ -84,6 +120,41 @@ def create_tables():
                     cursor.execute("""
                         ALTER TABLE file_transfers ADD COLUMN original_hash VARCHAR(64)
                     """)
+                
+            # Add role column to users table if it doesn't exist (for existing installations)
+            try:
+                cursor.execute("""
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'regular' NOT NULL
+                """)
+            except mysql.connector.Error:
+                # If the database doesn't support IF NOT EXISTS for ADD COLUMN
+                cursor.execute("""
+                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS 
+                    WHERE TABLE_NAME = 'users' AND COLUMN_NAME = 'role'
+                """)
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute("""
+                        ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'regular' NOT NULL
+                    """)
+            
+            # Insert default permissions if they don't exist
+            cursor.execute("SELECT COUNT(*) FROM permissions")
+            if cursor.fetchone()[0] == 0:
+                permissions = [
+                    ("read", "Permission to read/download files"),
+                    ("write", "Permission to write/upload files"),
+                    ("manage_users", "Permission to manage users and their permissions"),
+                    ("manage_files", "Permission to manage files and their permissions")
+                ]
+                cursor.executemany(
+                    "INSERT INTO permissions (name, description) VALUES (%s, %s)",
+                    permissions
+                )
+                
+            # Make the first user an admin if users table is empty
+            cursor.execute("SELECT COUNT(*) FROM users")
+            if cursor.fetchone()[0] == 0:
+                log_activity("No users found. The first registered user will be assigned as admin.")
                     
             mydb.commit()
             log_activity("Database tables verified and updated if needed")
@@ -100,13 +171,45 @@ def register_user(username, password, client_public_key):
     if mydb:
         cursor = mydb.cursor()
         try:
+            # Check if this is the first user
+            cursor.execute("SELECT COUNT(*) FROM users")
+            is_first_user = cursor.fetchone()[0] == 0
+            
             hashed_password = hashlib.sha256(password.encode()).hexdigest()
-            cursor.execute("INSERT INTO users (username, password, public_key) VALUES (%s, %s, %s)",
-                           (username, hashed_password, client_public_key))
+            
+            # If it's the first user, make them an admin
+            role = 'admin' if is_first_user else 'regular'
+            
+            cursor.execute("INSERT INTO users (username, password, public_key, role) VALUES (%s, %s, %s, %s)",
+                           (username, hashed_password, client_public_key, role))
+            user_id = cursor.lastrowid
+            
+            # If it's the first user (admin), give them all permissions
+            if is_first_user:
+                # Get all permission IDs
+                cursor.execute("SELECT id FROM permissions")
+                permissions = cursor.fetchall()
+                
+                # Assign all permissions to admin
+                for perm_id in permissions:
+                    cursor.execute("INSERT INTO user_permissions (user_id, permission_id) VALUES (%s, %s)",
+                                  (user_id, perm_id[0]))
+                
+                log_activity(f"User '{username}' registered as administrator with all permissions.")
+            else:
+                # Give regular users basic read and write permissions by default
+                cursor.execute("SELECT id FROM permissions WHERE name IN ('read', 'write')")
+                basic_permissions = cursor.fetchall()
+                
+                for perm_id in basic_permissions:
+                    cursor.execute("INSERT INTO user_permissions (user_id, permission_id) VALUES (%s, %s)",
+                                  (user_id, perm_id[0]))
+                
+                log_activity(f"User '{username}' registered with basic permissions.")
+            
             mydb.commit()
             cursor.close()
             mydb.close()
-            log_activity(f"User '{username}' registered successfully.")
             return True
         except mysql.connector.IntegrityError:
             cursor.close()
@@ -121,19 +224,33 @@ def register_user(username, password, client_public_key):
 
 
 def login_user(username, password):
-    """Verifies user credentials against the database."""
+    """Verifies user credentials against the database and returns user information if valid.
+    
+    Args:
+        username (str): The username to check
+        password (str): The password to verify
+        
+    Returns:
+        dict or False: Dictionary with user information if credentials are valid, False otherwise
+    """
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
-        cursor.execute("SELECT password FROM users WHERE username = %s", (username,))
+        cursor.execute("SELECT id, password, role FROM users WHERE username = %s", (username,))
         result = cursor.fetchone()
         cursor.close()
         mydb.close()
         if result:
+            user_id, stored_password, role = result
             hashed_password = hashlib.sha256(password.encode()).hexdigest()
-            if hashed_password == result[0]:
+            if hashed_password == stored_password:
                 log_activity(f"User '{username}' logged in successfully.")
-                return True
+                # Return user information including role
+                return {
+                    'id': user_id,
+                    'username': username,
+                    'role': role
+                }
             else:
                 log_activity(f"Login failed for user '{username}': Incorrect password.")
                 return False
@@ -186,6 +303,64 @@ def get_username_by_id(user_id):
         else:
             log_activity(f"Could not retrieve username for ID '{user_id}'.")
             return None
+
+
+def get_user_role(user_id):
+    """Retrieves the role of a user based on their user ID."""
+    mydb = create_db_connection()
+    if mydb:
+        cursor = mydb.cursor()
+        cursor.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        mydb.close()
+        if result:
+            return result[0]
+        else:
+            log_activity(f"Could not retrieve role for user ID '{user_id}'.")
+            return None
+
+
+def check_user_permission(user_id, permission_name):
+    """Checks if a user has a specific permission.
+    
+    Args:
+        user_id (int): The user's ID
+        permission_name (str): The name of the permission to check
+        
+    Returns:
+        bool: True if the user has the permission, False otherwise
+    """
+    mydb = create_db_connection()
+    if mydb:
+        cursor = mydb.cursor()
+        try:
+            # If the user is an admin, they have all permissions
+            cursor.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+            user_role = cursor.fetchone()
+            
+            if user_role and user_role[0] == 'admin':
+                cursor.close()
+                mydb.close()
+                return True
+                
+            # Check specific permission
+            cursor.execute("""
+                SELECT COUNT(*) FROM user_permissions up
+                JOIN permissions p ON up.permission_id = p.id
+                WHERE up.user_id = %s AND p.name = %s
+            """, (user_id, permission_name))
+            
+            has_permission = cursor.fetchone()[0] > 0
+            cursor.close()
+            mydb.close()
+            return has_permission
+        except mysql.connector.Error as err:
+            log_activity(f"Error checking permission '{permission_name}' for user ID '{user_id}': {err}")
+            cursor.close()
+            mydb.close()
+            return False
+    return False
 
 
 def get_transfer_history(user_id):
@@ -260,9 +435,16 @@ def handle_client(client_socket, client_address):
                         username = request.get('username')
                         password = request.get('password')
                         if username and password:
-                            if login_user(username, password):
+                            login_result = login_user(username, password)
+                            if login_result:
                                 logged_in_user = username
-                                response = {'status': 'success', 'message': 'Login successful'}
+                                response = {
+                                    'status': 'success', 
+                                    'message': 'Login successful',
+                                    'user_id': login_result['id'],
+                                    'username': login_result['username'],
+                                    'role': login_result['role']
+                                }
                             else:
                                 response = {'status': 'error', 'message': 'Invalid username or password'}
                         else:
