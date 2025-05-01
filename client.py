@@ -109,6 +109,8 @@ class FileTransferClientGUI:
 
         self.logged_in = False
         self.logged_in_user = None
+        self.user_id = None
+        self.user_role = None
         self.client_socket = None
 
         self.style = ttk.Style()  # Create a style object
@@ -151,6 +153,9 @@ class FileTransferClientGUI:
         # Disable transfer and history tabs initially
         self.notebook.tab(1, state="disabled")
         self.notebook.tab(2, state="disabled")
+        
+        # Admin tab will be created after login if user is admin
+        self.admin_frame = None
 
     def create_auth_widgets(self):
         # --- Registration ---
@@ -233,7 +238,13 @@ class FileTransferClientGUI:
         download_button = ttk.Button(
             button_frame, text="Download Selected File", command=self.download_selected_file
         )
-        download_button.pack(side='right', padx=5, fill='x', expand=True)
+        download_button.pack(side='left', padx=5, fill='x', expand=True)
+        
+        # File Permissions Button
+        file_perm_button = ttk.Button(
+            button_frame, text="Manage File Permissions", command=self.manage_file_permissions
+        )
+        file_perm_button.pack(side='left', padx=5, fill='x', expand=True)
 
     def send_request(self, request):
         """Sends a JSON request to the server."""
@@ -353,16 +364,27 @@ class FileTransferClientGUI:
                     if response['status'] == 'success':
                         self.logged_in = True
                         self.logged_in_user = username
+                        self.user_id = response.get('user_id')
+                        self.user_role = response.get('role')
+                        
+                        # Update UI based on user role
                         self.notebook.tab(1, state="normal") # Enable transfer tab
                         self.notebook.tab(2, state="normal") # Enable history tab
                         self.notebook.select(1) # Switch to transfer tab
-                        self.status_label.config(style="Blue.TLabel", text=f"Logged in as {self.logged_in_user}")
+                        self.status_label.config(style="Blue.TLabel", 
+                                               text=f"Logged in as {self.logged_in_user} ({self.user_role})")
                         self.send_button.config(state='normal')
                         self.get_transfer_history() # Load history on login
+                        
+                        # Create admin tab if user is an admin
+                        if self.user_role == 'admin':
+                            self.create_admin_tab()
                     else:
                         self.disable_transfer_tabs()
                         self.logged_in = False
                         self.logged_in_user = None
+                        self.user_id = None
+                        self.user_role = None
         else:
             messagebox.showerror("Error", "Username and password are required for login.")
 
@@ -375,6 +397,14 @@ class FileTransferClientGUI:
                     messagebox.showinfo("Logout", response['message'])
                     self.logged_in = False
                     self.logged_in_user = None
+                    self.user_id = None
+                    self.user_role = None
+                    
+                    # Remove admin tab if it exists
+                    if self.admin_frame:
+                        self.notebook.forget(self.admin_frame)
+                        self.admin_frame = None
+                        
                     self.disable_transfer_tabs()
                     self.notebook.select(0) # Switch back to authentication tab
                     self.status_label.config(text="Logged out", style="") # Revert to default style
@@ -529,152 +559,145 @@ class FileTransferClientGUI:
             self.notebook.select(0)
 
     def download_selected_file(self):
-        """Download and decrypt file with integrity verification."""
+        """Downloads the selected file from the server."""
         if not self.logged_in:
-            messagebox.showerror("Error", "Please log in to download files")
+            messagebox.showerror("Error", "Please log in before downloading files")
             return
-            
-        selected_item = self.history_tree.focus()
-        if not selected_item:
+
+        selected = self.history_tree.selection()
+        if not selected:
             messagebox.showerror("Error", "Please select a file to download")
             return
 
-        selected_values = self.history_tree.item(selected_item, 'values')
-        if not selected_values or selected_values[5] != 'success':
-            messagebox.showerror("Error", "The selected file is not available for download")
-            return
+        file_data = self.history_tree.item(selected, 'values')
+        filename = file_data[0]
 
-        filename = selected_values[0]
-        self.status_label.config(text=f"Requesting file: {filename}...")
-        
-        # Request file from server
-        request = {'action': 'download_file', 'filename': filename}
-        if not self.send_request(request):
-            self.status_label.config(style="Red.TLabel", text="Failed to send download request")
-            return
-            
-        # Process server response
-        response = self.receive_response()
-        if not response or response.get('status') != 'success':
-            messagebox.showerror("Error", response.get('message', "Failed to download file"))
-            return
-            
-        # Extract necessary information
         try:
-            file_size = response.get('file_size')
-            encrypted_key_hex = response.get('encrypted_key')
-            original_hash = response.get('original_hash')  # Get original file hash for verification
+            # Create download directory if it doesn't exist
+            os.makedirs("downloads", exist_ok=True)
             
-            if not file_size or not encrypted_key_hex:
-                raise ValueError("Missing required file metadata")
-                
-            self.status_label.config(text=f"Downloading {filename} ({file_size} bytes)...")
-            
-            # Receive encrypted file data
-            received_data = b""
-            bytes_received = 0
-            
-            # Set a timeout for receiving data
-            self.client_socket.settimeout(30)  # 30-second timeout
-            
-            try:
-                while bytes_received < file_size:
-                    chunk = self.client_socket.recv(BUFFER_SIZE)
-                    if not chunk:
-                        break  # Connection closed prematurely
-                    received_data += chunk
-                    bytes_received += len(chunk)
-                    
-                    # Update status periodically
-                    if bytes_received % (BUFFER_SIZE * 10) == 0:
-                        self.status_label.config(text=f"Downloading: {bytes_received/file_size*100:.1f}% complete")
-            except socket.timeout:
-                raise TimeoutError("Download timed out")
-            finally:
-                # Reset socket timeout
-                self.client_socket.settimeout(None)
-                
-            # Verify received data size
-            if bytes_received != file_size:
-                raise ValueError(f"Incomplete download: expected {file_size} bytes, got {bytes_received} bytes")
-                
-            self.status_label.config(text="Decrypting file...")
-            
-            # Get password for private key decryption
-            password = askstring("Password Required", "Enter your password to decrypt the file:", show="*")
-            if not password:
-                self.status_label.config(style="Red.TLabel", text="Decryption cancelled - no password provided")
-                return
-                
-            # Decrypt the private key
-            try:
-                # Load encrypted private key
-                with open(f"{self.logged_in_user}_private.enc", "r") as f:
-                    encrypted_private_key_data = f.read()
-                    
-                # Decrypt the private key
-                decrypted_private_key = decrypt_private_key(encrypted_private_key_data, password)
-                if not decrypted_private_key:
-                    raise ValueError("Failed to decrypt private key - check your password")
-            except FileNotFoundError:
-                raise ValueError(f"Private key file not found for user {self.logged_in_user}")
-            except Exception as e:
-                raise ValueError(f"Error accessing private key: {e}")
-                
-            # Decrypt the symmetric key
-            try:
-                encrypted_symmetric_key = bytes.fromhex(encrypted_key_hex)
-                decrypted_symmetric_key = decrypted_private_key.decrypt(
-                    encrypted_symmetric_key,
-                    padding.OAEP(
-                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                        algorithm=hashes.SHA256(),
-                        label=None
-                    )
-                )
-            except Exception as e:
-                raise ValueError(f"Failed to decrypt the symmetric key: {e}")
-                
-            # Decrypt the file
-            try:
-                fernet = Fernet(decrypted_symmetric_key)
-                decrypted_data = fernet.decrypt(received_data)
-            except Exception as e:
-                raise ValueError(f"Failed to decrypt the file: {e}")
-                
-            # Verify file integrity if hash is available
-            if original_hash:
-                hash_obj = hashlib.sha256()
-                hash_obj.update(decrypted_data)
-                calculated_hash = hash_obj.hexdigest()
-                
-                if calculated_hash != original_hash:
-                    raise ValueError("File integrity check failed - the file may have been tampered with")
-                    
-            # Save the decrypted file
-            file_extension = os.path.splitext(filename)[1]
-            save_path = filedialog.asksaveasfilename(
+            # Prompt user for download location
+            download_path = filedialog.asksaveasfilename(
+                initialdir="downloads",
                 initialfile=filename,
-                defaultextension=file_extension,
-                filetypes=[("All Files", "*.*"), (f"{file_extension.upper()} Files", f"*{file_extension}")]
+                title="Save File As",
+                filetypes=(("All Files", "*.*"),)
             )
             
-            if save_path:
-                try:
-                    with open(save_path, 'wb') as f:
-                        f.write(decrypted_data)
-                    messagebox.showinfo("Success", f"File '{filename}' successfully decrypted and verified.")
-                    self.status_label.config(style="Green.TLabel", text=f"File downloaded and verified successfully")
-                except Exception as e:
-                    raise ValueError(f"Failed to save decrypted file: {e}")
-            else:
-                self.status_label.config(text="File download cancelled by user")
+            if not download_path:
+                # User cancelled
+                return
                 
-        except ValueError as e:
-            messagebox.showerror("Error", str(e))
-            self.status_label.config(style="Red.TLabel", text=f"Download failed: {e}")
+            # Request file from server
+            request = {'action': 'download_file', 'filename': filename}
+            if self.send_request(request):
+                response = self.receive_response()
+                
+                if response and response.get('status') == 'error':
+                    # Handle permission error
+                    if "permission" in response.get('message', '').lower():
+                        messagebox.showerror("Permission Denied", 
+                            "You don't have permission to download this file. Please contact the file owner.")
+                    else:
+                        messagebox.showerror("Download Error", response.get('message', "Failed to download file"))
+                    return
+                
+                if response and response.get('status') == 'success':
+                    try:
+                        # Get file size and symmetric key
+                        file_size = response.get('file_size')
+                        encrypted_key_hex = response.get('encrypted_key')
+                        original_hash = response.get('original_hash')  # For integrity verification
+                        
+                        # Convert encrypted key from hex back to bytes
+                        encrypted_key = bytes.fromhex(encrypted_key_hex)
+                        
+                        # Load private key from disk
+                        with open(f"{self.logged_in_user}_private.enc", "r") as f:
+                            encrypted_private_key_data = f.read()
+                            
+                        # Ask for password to decrypt the private key
+                        password = askstring("Password Required", "Enter your password to decrypt the file:", show='*')
+                        if not password:
+                            return  # User cancelled
+                            
+                        # Decrypt private key
+                        private_key = decrypt_private_key(encrypted_private_key_data, password)
+                        if not private_key:
+                            messagebox.showerror("Decryption Error", "Failed to decrypt your private key. Incorrect password?")
+                            return
+                            
+                        # Decrypt symmetric key with private key
+                        try:
+                            symmetric_key = private_key.decrypt(
+                                encrypted_key,
+                                padding.OAEP(
+                                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                    algorithm=hashes.SHA256(),
+                                    label=None
+                                )
+                            )
+                        except Exception as e:
+                            messagebox.showerror("Decryption Error", f"Failed to decrypt file key: {e}")
+                            return
+                        
+                        # Set a timeout for receiving the file
+                        self.client_socket.settimeout(60)  # 60-second timeout
+                        
+                        try:
+                            # Receive encrypted file data
+                            self.status_label.config(text=f"Downloading file ({file_size} bytes)...")
+                            
+                            received_data = b""
+                            bytes_received = 0
+                            
+                            while bytes_received < file_size:
+                                chunk = self.client_socket.recv(BUFFER_SIZE)
+                                if not chunk:
+                                    break
+                                received_data += chunk
+                                bytes_received += len(chunk)
+                        finally:
+                            # Reset socket timeout
+                            self.client_socket.settimeout(None)
+                        
+                        # Verify received size
+                        if bytes_received != file_size:
+                            messagebox.showerror("Download Error", f"Incomplete file: received {bytes_received}/{file_size} bytes")
+                            return
+                        
+                        # Decrypt file with symmetric key
+                        try:
+                            fernet = Fernet(symmetric_key)
+                            decrypted_data = fernet.decrypt(received_data)
+                            
+                            # Verify integrity if hash was provided
+                            if original_hash:
+                                hash_obj = hashlib.sha256()
+                                hash_obj.update(decrypted_data)
+                                calculated_hash = hash_obj.hexdigest()
+                                
+                                if calculated_hash != original_hash:
+                                    messagebox.showerror("Integrity Error", 
+                                        "File hash verification failed! The file may have been tampered with.")
+                                    # Continue anyway but warn the user
+                                
+                            # Save the decrypted file
+                            with open(download_path, 'wb') as f:
+                                f.write(decrypted_data)
+                                
+                            messagebox.showinfo("Success", f"File downloaded and decrypted successfully to {download_path}")
+                            self.status_label.config(style="Green.TLabel", text=f"File downloaded: {filename}")
+                        except Exception as e:
+                            messagebox.showerror("Decryption Error", f"Failed to decrypt file: {e}")
+                            
+                    except Exception as e:
+                        messagebox.showerror("Download Error", f"Error during download: {e}")
+                        self.status_label.config(style="Red.TLabel", text=f"Download error: {e}")
+                else:
+                    messagebox.showerror("Error", "Failed to download file")
         except Exception as e:
-            messagebox.showerror("Error", f"Unexpected error during download: {e}")
+            messagebox.showerror("Error", f"Unexpected error: {e}")
             self.status_label.config(style="Red.TLabel", text=f"Error: {e}")
 
     def populate_history_tree(self):
@@ -700,6 +723,392 @@ class FileTransferClientGUI:
             except socket.error:
                 pass
         self.master.destroy()
+
+    def create_admin_tab(self):
+        """Creates the admin tab with user management functionality."""
+        # Check if admin tab already exists
+        if self.admin_frame:
+            return
+            
+        # Create admin frame
+        self.admin_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.admin_frame, text='Admin')
+        
+        # Create user management section
+        user_management_frame = ttk.LabelFrame(self.admin_frame, text="User Management")
+        user_management_frame.pack(padx=10, pady=10, fill='both', expand=True)
+        
+        # User list
+        ttk.Label(user_management_frame, text="Users:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        
+        # Create treeview for users
+        self.users_tree = ttk.Treeview(
+            user_management_frame,
+            columns=('username', 'role', 'id'),
+            show='headings',
+            selectmode='browse'
+        )
+        self.users_tree.heading('username', text='Username')
+        self.users_tree.heading('role', text='Role')
+        self.users_tree.heading('id', text='ID')
+        self.users_tree.column('username', width=150)
+        self.users_tree.column('role', width=100)
+        self.users_tree.column('id', width=50)
+        self.users_tree.grid(row=1, column=0, padx=5, pady=5, sticky='nsew', columnspan=2)
+        
+        # Scrollbar for users tree
+        users_scrollbar = ttk.Scrollbar(user_management_frame, orient='vertical', command=self.users_tree.yview)
+        users_scrollbar.grid(row=1, column=2, sticky='ns')
+        self.users_tree.configure(yscrollcommand=users_scrollbar.set)
+        
+        # Buttons frame
+        buttons_frame = ttk.Frame(user_management_frame)
+        buttons_frame.grid(row=2, column=0, columnspan=3, padx=5, pady=5, sticky='ew')
+        
+        # Refresh users button
+        refresh_users_button = ttk.Button(buttons_frame, text="Refresh User List", command=self.get_users)
+        refresh_users_button.pack(side='left', padx=5, pady=5)
+        
+        # Change user role button
+        change_role_button = ttk.Button(buttons_frame, text="Change User Role", command=self.change_user_role)
+        change_role_button.pack(side='left', padx=5, pady=5)
+        
+        # Permissions management section
+        permissions_frame = ttk.LabelFrame(self.admin_frame, text="User Permissions")
+        permissions_frame.pack(padx=10, pady=10, fill='both', expand=True)
+        
+        # User selection for permissions
+        ttk.Label(permissions_frame, text="User:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        self.permission_user_combobox = ttk.Combobox(permissions_frame, state='readonly')
+        self.permission_user_combobox.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+        
+        # Permission type selection
+        ttk.Label(permissions_frame, text="Permission:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        self.permission_type_combobox = ttk.Combobox(permissions_frame, state='readonly', 
+                                                  values=('read', 'write', 'manage_users', 'manage_files'))
+        self.permission_type_combobox.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+        
+        # Buttons for permission management
+        perm_buttons_frame = ttk.Frame(permissions_frame)
+        perm_buttons_frame.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
+        
+        grant_button = ttk.Button(perm_buttons_frame, text="Grant Permission", command=self.grant_permission)
+        grant_button.pack(side='left', padx=5, pady=5)
+        
+        revoke_button = ttk.Button(perm_buttons_frame, text="Revoke Permission", command=self.revoke_permission)
+        revoke_button.pack(side='left', padx=5, pady=5)
+        
+        # Load users immediately
+        self.get_users()
+        
+    def get_users(self):
+        """Retrieves the list of users from the server."""
+        if not self.logged_in or self.user_role != 'admin':
+            messagebox.showerror("Error", "You don't have permission to manage users")
+            return
+            
+        request = {'action': 'get_users'}
+        if self.send_request(request):
+            response = self.receive_response()
+            if response and response.get('status') == 'success':
+                # Clear existing items
+                for item in self.users_tree.get_children():
+                    self.users_tree.delete(item)
+                    
+                # Populate with new data
+                users = response.get('users', [])
+                for user in users:
+                    self.users_tree.insert('', 'end', values=(
+                        user.get('username', ''),
+                        user.get('role', ''),
+                        user.get('id', '')
+                    ))
+                    
+                # Update permission user combobox
+                self.permission_user_combobox['values'] = [user.get('username', '') for user in users]
+                
+                self.status_label.config(text=f"Retrieved {len(users)} users")
+            else:
+                messagebox.showerror("Error", response.get('message', "Failed to retrieve users"))
+                
+    def change_user_role(self):
+        """Changes the role of a selected user."""
+        if not self.logged_in or self.user_role != 'admin':
+            messagebox.showerror("Error", "You don't have permission to manage users")
+            return
+            
+        selected = self.users_tree.selection()
+        if not selected:
+            messagebox.showerror("Error", "Please select a user")
+            return
+            
+        user_values = self.users_tree.item(selected, 'values')
+        username = user_values[0]
+        current_role = user_values[1]
+        
+        # Don't allow changing own role
+        if username == self.logged_in_user:
+            messagebox.showerror("Error", "You cannot change your own role")
+            return
+            
+        # Ask for new role
+        new_role = simpledialog.askstring(
+            "Change Role", 
+            f"Enter new role for {username} (current: {current_role}):",
+            initialvalue=current_role
+        )
+        
+        if new_role and new_role != current_role:
+            # New role selected, send request to server
+            request = {
+                'action': 'change_user_role',
+                'target_username': username,
+                'new_role': new_role
+            }
+            
+            if self.send_request(request):
+                response = self.receive_response()
+                if response and response.get('status') == 'success':
+                    messagebox.showinfo("Success", f"User {username} role changed to {new_role}")
+                    self.get_users()  # Refresh user list
+                else:
+                    messagebox.showerror("Error", response.get('message', "Failed to change user role"))
+                    
+    def grant_permission(self):
+        """Grants a permission to a user."""
+        if not self.logged_in or self.user_role != 'admin':
+            messagebox.showerror("Error", "You don't have permission to manage users")
+            return
+            
+        username = self.permission_user_combobox.get()
+        permission = self.permission_type_combobox.get()
+        
+        if not username or not permission:
+            messagebox.showerror("Error", "Please select both user and permission")
+            return
+            
+        request = {
+            'action': 'grant_permission',
+            'target_username': username,
+            'permission': permission
+        }
+        
+        if self.send_request(request):
+            response = self.receive_response()
+            if response and response.get('status') == 'success':
+                messagebox.showinfo("Success", f"Permission '{permission}' granted to {username}")
+            else:
+                messagebox.showerror("Error", response.get('message', "Failed to grant permission"))
+                
+    def revoke_permission(self):
+        """Revokes a permission from a user."""
+        if not self.logged_in or self.user_role != 'admin':
+            messagebox.showerror("Error", "You don't have permission to manage users")
+            return
+            
+        username = self.permission_user_combobox.get()
+        permission = self.permission_type_combobox.get()
+        
+        if not username or not permission:
+            messagebox.showerror("Error", "Please select both user and permission")
+            return
+            
+        request = {
+            'action': 'revoke_permission',
+            'target_username': username,
+            'permission': permission
+        }
+        
+        if self.send_request(request):
+            response = self.receive_response()
+            if response and response.get('status') == 'success':
+                messagebox.showinfo("Success", f"Permission '{permission}' revoked from {username}")
+            else:
+                messagebox.showerror("Error", response.get('message', "Failed to revoke permission"))
+
+    def manage_file_permissions(self):
+        """Opens a dialog to manage file permissions."""
+        if not self.logged_in:
+            messagebox.showerror("Error", "Please log in to manage file permissions")
+            return
+            
+        # Get selected file
+        selected = self.history_tree.selection()
+        if not selected:
+            messagebox.showerror("Error", "Please select a file to manage permissions")
+            return
+            
+        # Get file details
+        file_data = self.history_tree.item(selected, 'values')
+        filename = file_data[0]
+        sender = file_data[1]
+        
+        # Check if user is owner or admin
+        if sender != self.logged_in_user and self.user_role != 'admin':
+            messagebox.showerror("Error", "You can only manage permissions for files you own")
+            return
+            
+        # Create permissions dialog
+        perm_dialog = tk.Toplevel(self.master)
+        perm_dialog.title(f"File Permissions: {filename}")
+        perm_dialog.geometry("400x400")
+        perm_dialog.transient(self.master)
+        perm_dialog.grab_set()
+        
+        # Display current permissions
+        ttk.Label(perm_dialog, text=f"Manage permissions for: {filename}").pack(padx=10, pady=10)
+        
+        # Frame for permissions
+        perm_frame = ttk.Frame(perm_dialog)
+        perm_frame.pack(padx=10, pady=10, fill='both', expand=True)
+        
+        # Current permissions
+        perm_tree = ttk.Treeview(
+            perm_frame,
+            columns=('username', 'permission'),
+            show='headings',
+            selectmode='browse'
+        )
+        perm_tree.heading('username', text='Username')
+        perm_tree.heading('permission', text='Permission')
+        perm_tree.column('username', width=150)
+        perm_tree.column('permission', width=100)
+        perm_tree.pack(padx=5, pady=5, fill='both', expand=True)
+        
+        # Get file permissions
+        self.get_file_permissions(filename, perm_tree)
+        
+        # Frame for adding new permission
+        add_frame = ttk.LabelFrame(perm_dialog, text="Add Permission")
+        add_frame.pack(padx=10, pady=10, fill='x')
+        
+        # User selection
+        ttk.Label(add_frame, text="User:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        user_entry = ttk.Entry(add_frame)
+        user_entry.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+        
+        # Permission type
+        ttk.Label(add_frame, text="Permission:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        perm_type = ttk.Combobox(add_frame, values=('read', 'write', 'manage'), state='readonly')
+        perm_type.set('read')
+        perm_type.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+        
+        # Public permission checkbox
+        is_public_var = tk.BooleanVar()
+        is_public = ttk.Checkbutton(add_frame, text="Make Public", variable=is_public_var)
+        is_public.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky='w')
+        
+        # Buttons frame
+        button_frame = ttk.Frame(perm_dialog)
+        button_frame.pack(pady=10, fill='x')
+        
+        # Function to set permission
+        def set_permission():
+            target_user = user_entry.get()
+            permission = perm_type.get()
+            public = is_public_var.get()
+            
+            if not permission:
+                messagebox.showerror("Error", "Please select a permission type")
+                return
+                
+            if not target_user and not public:
+                messagebox.showerror("Error", "Please enter a username or select 'Make Public'")
+                return
+                
+            # Send set permission request
+            request = {
+                'action': 'set_file_permission',
+                'filename': filename,
+                'permission_type': permission,
+                'is_public': public
+            }
+            
+            # Add target username if specified
+            if target_user:
+                request['target_username'] = target_user
+                
+            if self.send_request(request):
+                response = self.receive_response()
+                if response and response.get('status') == 'success':
+                    messagebox.showinfo("Success", "Permission set successfully")
+                    # Refresh permissions list
+                    self.get_file_permissions(filename, perm_tree)
+                else:
+                    messagebox.showerror("Error", response.get('message', "Failed to set permission"))
+        
+        # Function to remove permission
+        def remove_permission():
+            selected_item = perm_tree.selection()
+            if not selected_item:
+                messagebox.showerror("Error", "Please select a permission to remove")
+                return
+                
+            perm_data = perm_tree.item(selected_item, 'values')
+            target_user = perm_data[0]
+            permission = perm_data[1]
+            
+            is_public = (target_user == "PUBLIC")
+            
+            # Send remove permission request
+            request = {
+                'action': 'remove_file_permission',
+                'filename': filename,
+                'permission_type': permission,
+                'is_public': is_public
+            }
+            
+            # Add target username if not public
+            if not is_public:
+                request['target_username'] = target_user
+                
+            if self.send_request(request):
+                response = self.receive_response()
+                if response and response.get('status') == 'success':
+                    messagebox.showinfo("Success", "Permission removed successfully")
+                    # Refresh permissions list
+                    self.get_file_permissions(filename, perm_tree)
+                else:
+                    messagebox.showerror("Error", response.get('message', "Failed to remove permission"))
+        
+        # Add buttons
+        add_button = ttk.Button(button_frame, text="Add Permission", command=set_permission)
+        add_button.pack(side='left', padx=5, pady=5, fill='x', expand=True)
+        
+        remove_button = ttk.Button(button_frame, text="Remove Permission", command=remove_permission)
+        remove_button.pack(side='left', padx=5, pady=5, fill='x', expand=True)
+        
+        close_button = ttk.Button(button_frame, text="Close", command=perm_dialog.destroy)
+        close_button.pack(side='left', padx=5, pady=5, fill='x', expand=True)
+        
+    def get_file_permissions(self, filename, perm_tree=None):
+        """Retrieves file permissions from the server."""
+        request = {'action': 'get_file_permissions', 'filename': filename}
+        
+        if self.send_request(request):
+            response = self.receive_response()
+            if response and response.get('status') == 'success':
+                permissions = response.get('permissions', {})
+                
+                # Clear the tree if provided
+                if perm_tree:
+                    for item in perm_tree.get_children():
+                        perm_tree.delete(item)
+                        
+                    # Add user permissions
+                    for perm in permissions.get('user_permissions', []):
+                        perm_tree.insert('', 'end', values=(perm.get('username'), perm.get('permission')))
+                        
+                    # Add public permissions
+                    for perm in permissions.get('public_permissions', []):
+                        perm_tree.insert('', 'end', values=("PUBLIC", perm))
+                        
+                return permissions
+            else:
+                if perm_tree:
+                    messagebox.showerror("Error", response.get('message', "Failed to retrieve file permissions"))
+                return None
+        return None
 
 def main():
     root = tk.Tk()
