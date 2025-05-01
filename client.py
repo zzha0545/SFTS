@@ -29,6 +29,9 @@ DATABASE_CONFIG = {
 def decrypt_private_key(encrypted_private_key_data, password):
     """Decrypts an encrypted private RSA key using the user's password with enhanced error handling."""
     try:
+        # Log the start of decryption process
+        print(f"Starting private key decryption, key data length: {len(encrypted_private_key_data) if encrypted_private_key_data else 'None'}")
+        
         # Input validation
         if not encrypted_private_key_data or not password:
             raise ValueError("Missing required decryption parameters")
@@ -37,9 +40,10 @@ def decrypt_private_key(encrypted_private_key_data, password):
         try:
             parts = encrypted_private_key_data.split(":")
             if len(parts) != 3:
-                raise ValueError("Invalid private key format - expected 3 components")
+                raise ValueError(f"Invalid private key format - expected 3 components, got {len(parts)}")
                 
             salt_encoded, iv_encoded, encrypted_private_key_encoded = parts
+            print(f"Private key components parsed successfully: salt={len(salt_encoded)}, iv={len(iv_encoded)}, enc_key={len(encrypted_private_key_encoded)}")
         except Exception as e:
             raise ValueError(f"Failed to parse private key data: {e}")
 
@@ -47,19 +51,20 @@ def decrypt_private_key(encrypted_private_key_data, password):
         try:
             salt = base64.urlsafe_b64decode(salt_encoded)
             if len(salt) != 16:
-                raise ValueError("Invalid salt length - must be 16 bytes")
+                raise ValueError(f"Invalid salt length - must be 16 bytes, got {len(salt)}")
         except Exception as e:
             raise ValueError(f"Salt decoding failed: {e}")
             
         try:
             iv = base64.b64decode(iv_encoded)
             if len(iv) != 16:
-                raise ValueError("Invalid IV length - must be 16 bytes")
+                raise ValueError(f"Invalid IV length - must be 16 bytes, got {len(iv)}")
         except Exception as e:
             raise ValueError(f"IV decoding failed: {e}")
             
         try:
             encrypted_private_key = base64.b64decode(encrypted_private_key_encoded)
+            print(f"Successfully decoded encrypted private key data, length: {len(encrypted_private_key)} bytes")
         except Exception as e:
             raise ValueError(f"Encrypted key decoding failed: {e}")
 
@@ -72,6 +77,7 @@ def decrypt_private_key(encrypted_private_key_data, password):
                 iterations=100000,
             )
             derived_key = kdf.derive(password.encode())
+            print(f"Password-derived key generation successful, length: {len(derived_key)} bytes")
         except Exception as e:
             raise ValueError(f"Key derivation process failed: {e}")
 
@@ -80,6 +86,7 @@ def decrypt_private_key(encrypted_private_key_data, password):
             cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv))
             decryptor = cipher.decryptor()
             decrypted_private_key_padded = decryptor.update(encrypted_private_key) + decryptor.finalize()
+            print(f"AES decryption successful, decrypted data length: {len(decrypted_private_key_padded)} bytes")
         except Exception as e:
             raise ValueError(f"Decryption failed - password may be incorrect: {e}")
 
@@ -90,20 +97,25 @@ def decrypt_private_key(encrypted_private_key_data, password):
             
             # Validate PEM structure before attempting to load
             if not decrypted_private_key_pem.startswith(b"-----BEGIN PRIVATE KEY-----"):
+                # Print first 50 bytes for debugging
+                print(f"Invalid PEM format: First 50 bytes: {decrypted_private_key_pem[:50]}")
                 raise ValueError("Decrypted data is not a valid PEM private key")
+            
+            print("Private key PEM format validated, loading...")
                 
             # Load the private key
             private_key = serialization.load_pem_private_key(
                 decrypted_private_key_pem,
                 password=None
             )
+            print("RSA private key loaded successfully")
             return private_key
         except Exception as e:
             raise ValueError(f"Failed to load decrypted private key: {e}")
 
     except ValueError as e:
         # Log specific error for debugging
-        print(f"Private key decryption error: {e}")
+        print(f"Private key decryption error details: {e}")
         return None
     except Exception as e:
         # Catch any unexpected errors
@@ -695,6 +707,7 @@ class FileTransferClientGUI:
                     hash_obj = hashlib.sha256()
                     hash_obj.update(file_data)
                     original_file_hash = hash_obj.hexdigest()
+                print(f"Original file hash: {original_file_hash}")
             except IOError as e:
                 messagebox.showerror("File Error", f"Unable to read file: {e}")
                 return
@@ -705,9 +718,15 @@ class FileTransferClientGUI:
             # Generate encryption key and encrypt file
             try:
                 filename = os.path.basename(file_path)
-                # Generate a random symmetric key
-                symmetric_key = Fernet.generate_key()
-                fernet = Fernet(symmetric_key)
+                
+                # Generate a random symmetric key (32 bytes for Fernet)
+                symmetric_key = os.urandom(32)
+                print(f"Generated symmetric key of {len(symmetric_key)} bytes")
+                
+                # Convert to Fernet-compatible format (URL-safe base64)
+                fernet_key = base64.urlsafe_b64encode(symmetric_key)
+                fernet = Fernet(fernet_key)
+                print(f"Created Fernet with key: {fernet_key[:10]}...")
                 
                 # Encrypt the file data
                 encrypted_data = fernet.encrypt(file_data)
@@ -733,8 +752,10 @@ class FileTransferClientGUI:
                     
                     # Encrypt symmetric key with recipient's public key
                     try:
+                        print(f"Encrypting symmetric key for recipient: {recipient}")
+                        # We'll encrypt the raw 32-byte key, not the base64 encoded version
                         encrypted_symmetric_key = recipient_public_key.encrypt(
-                            symmetric_key,
+                            symmetric_key,  # Use the raw symmetric key
                             padding.OAEP(
                                 mgf=padding.MGF1(algorithm=hashes.SHA256()),
                                 algorithm=hashes.SHA256(),
@@ -742,6 +763,7 @@ class FileTransferClientGUI:
                             )
                         )
                         encrypted_symmetric_key_hex = encrypted_symmetric_key.hex()
+                        print(f"Symmetric key encrypted, length: {len(encrypted_symmetric_key)} bytes")
                     except Exception as e:
                         messagebox.showerror("Encryption Error", f"Unable to encrypt symmetric key: {e}")
                         return
@@ -870,22 +892,49 @@ class FileTransferClientGUI:
                     if not password:
                         return  # User cancelled
                         
+                    # Ensure crypto_padding is imported
+                    from cryptography.hazmat.primitives.asymmetric import padding as crypto_padding
+                        
                     # Decrypt private key
                     private_key = decrypt_private_key(encrypted_private_key_data, password)
                     if not private_key:
-                        messagebox.showerror("Decryption Error", "Failed to decrypt your private key. Incorrect password?")
-                        return
+                        # If decryption fails, try alternative password handling approaches
+                        print("First private key decryption attempt failed, trying alternative methods...")
+                        
+                        # Alternative 1: Try with UTF-8 re-encoded password
+                        try:
+                            private_key = decrypt_private_key(encrypted_private_key_data, password.encode().decode('utf-8'))
+                            if private_key:
+                                print("Successfully decrypted private key using UTF-8 re-encoded password")
+                        except:
+                            pass
+                            
+                        # Alternative 2: Try with stripped password
+                        if not private_key:
+                            try:
+                                private_key = decrypt_private_key(encrypted_private_key_data, password.strip())
+                                if private_key:
+                                    print("Successfully decrypted private key using stripped password")
+                            except:
+                                pass
+                                
+                        # If still unsuccessful, notify user
+                        if not private_key:
+                            messagebox.showerror("Decryption Error", "Unable to decrypt your private key. Please check your password.")
+                            return
                         
                     # Decrypt symmetric key with private key
                     try:
+                        print("Attempting to decrypt the file symmetric key...")
                         symmetric_key = private_key.decrypt(
                             encrypted_key,
-                            padding.OAEP(
-                                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                            crypto_padding.OAEP(
+                                mgf=crypto_padding.MGF1(algorithm=hashes.SHA256()),
                                 algorithm=hashes.SHA256(),
                                 label=None
                             )
                         )
+                        print(f"File symmetric key decrypted successfully, length: {len(symmetric_key)} bytes")
                     except Exception as e:
                         messagebox.showerror("Decryption Error", f"Failed to decrypt file key: {e}")
                         return
@@ -917,10 +966,94 @@ class FileTransferClientGUI:
                     
                     # Decrypt file with symmetric key
                     try:
-                        fernet = Fernet(symmetric_key)
-                        decrypted_data = fernet.decrypt(received_data)
+                        # Prepare Fernet key from symmetric key
+                        try:
+                            # First, check if the key is already in correct Fernet format
+                            try:
+                                fernet = Fernet(symmetric_key)
+                                print("Using symmetric key directly with Fernet")
+                            except Exception as direct_error:
+                                print(f"Cannot use symmetric key directly: {direct_error}")
+                                
+                                # Try to properly format the key as Fernet requires
+                                if len(symmetric_key) == 32:
+                                    # If raw 32-byte key, encode to URL-safe base64
+                                    print("Converting raw 32-byte key to Fernet format")
+                                    symmetric_key_base64 = base64.urlsafe_b64encode(symmetric_key)
+                                    fernet = Fernet(symmetric_key_base64)
+                                    print("Successfully formatted key for Fernet")
+                                else:
+                                    # Try with padding correction
+                                    print("Trying to fix base64 padding")
+                                    missing_padding = len(symmetric_key) % 4
+                                    if missing_padding:
+                                        symmetric_key_padded = symmetric_key + b'=' * (4 - missing_padding)
+                                    else:
+                                        symmetric_key_padded = symmetric_key
+                                    fernet = Fernet(symmetric_key_padded)
+                        except Exception as e:
+                            print(f"All Fernet initialization attempts failed, trying last resort approach: {e}")
+                            
+                            # Additional debug info
+                            print(f"Symmetric key type: {type(symmetric_key)}, length: {len(symmetric_key)}")
+                            if isinstance(symmetric_key, bytes):
+                                print(f"Key starts with: {symmetric_key[:10].hex()}")
+                            
+                            # Last resort: Try creating a new Fernet key from the symmetric key
+                            try:
+                                # Ensure we have exactly 32 bytes for the key
+                                if len(symmetric_key) < 32:
+                                    # Pad the key if it's too short
+                                    key_bytes = symmetric_key + b'\0' * (32 - len(symmetric_key))
+                                elif len(symmetric_key) > 32:
+                                    # Use a hash of the key if it's too long
+                                    key_bytes = hashlib.sha256(symmetric_key).digest()
+                                else:
+                                    key_bytes = symmetric_key
+                                
+                                # Convert to Fernet format (URL-safe base64-encoded)
+                                urlsafe_key = base64.urlsafe_b64encode(key_bytes)
+                                fernet = Fernet(urlsafe_key)
+                                print(f"Created Fernet key using fallback method: {urlsafe_key[:10]}...")
+                            except Exception as final_e:
+                                print(f"Final Fernet key attempt failed: {final_e}")
+                                messagebox.showerror("Decryption Error", f"Unable to create decryptor: {final_e}")
+                                return
                         
-                        # Verify integrity if hash was provided
+                        try:
+                            # Try decryption
+                            print("Attempting file decryption...")
+                            decrypted_data = fernet.decrypt(received_data)
+                            print(f"File decryption successful, size: {len(decrypted_data)} bytes")
+                        except Exception as e:
+                            print(f"File decryption failed with error: {e}")
+                            
+                            # Additional debug info
+                            print(f"Received data size: {len(received_data)} bytes")
+                            print(f"First 20 bytes of encrypted data: {received_data[:20].hex()}")
+                            
+                            # Try with padding check
+                            try:
+                                padded_data = received_data
+                                # Ensure data length is multiple of 16 for AES
+                                if len(received_data) % 16 != 0:
+                                    missing = 16 - (len(received_data) % 16)
+                                    padded_data = received_data + b'\0' * missing
+                                    print(f"Added {missing} bytes of padding to encrypted data")
+                                
+                                # One more try with padded data
+                                decrypted_data = fernet.decrypt(padded_data)
+                                print("Successfully decrypted with padded data")
+                            except Exception as pad_e:
+                                # Specialized error for token issues
+                                if "token" in str(e).lower():
+                                    messagebox.showerror("Decryption Error", 
+                                        "Token verification failed. The encryption key may be incorrect or the file data is corrupted.")
+                                else:
+                                    messagebox.showerror("Decryption Error", f"File data decryption failed: {e}")
+                                return
+                        
+                        # Verify integrity if original hash is provided
                         if original_hash:
                             hash_obj = hashlib.sha256()
                             hash_obj.update(decrypted_data)
@@ -929,17 +1062,17 @@ class FileTransferClientGUI:
                             if calculated_hash != original_hash:
                                 messagebox.showerror("Integrity Error", 
                                     "File hash verification failed! The file may have been tampered with.")
-                                # Continue anyway but warn the user
+                                # Continue but warn the user
                         
-                        # Save the decrypted file
+                        # Save decrypted file
                         with open(download_path, 'wb') as f:
                             f.write(decrypted_data)
                             
                         messagebox.showinfo("Success", f"File downloaded and decrypted successfully to {download_path}")
-                        self.status_label.config(style="Green.TLabel", text=f"File downloaded: {filename}")
+                        self.status_label.config(style="Green.TLabel", text=f"File download complete: {filename}")
                     except Exception as e:
-                        messagebox.showerror("Decryption Error", f"Failed to decrypt file: {e}")
-                        
+                        print(f"Detailed error during file decryption: {e}")
+                        messagebox.showerror("Decryption Error", f"File decryption failed: {e}")
                 except Exception as e:
                     messagebox.showerror("Download Error", f"Error during download: {e}")
                     self.status_label.config(style="Red.TLabel", text=f"Download error: {e}")
