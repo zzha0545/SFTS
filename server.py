@@ -165,8 +165,22 @@ def create_tables():
             mydb.close()
 
 
-def register_user(username, password, client_public_key):
-    """Registers a new user in the database."""
+def register_user(username, password, client_public_key, requested_role=None, admin_password=None):
+    """Registers a new user in the database.
+    
+    Args:
+        username (str): Username for the new user
+        password (str): Password for the new user
+        client_public_key (str): Public key in PEM format
+        requested_role (str, optional): Requested user role ('admin' or 'regular')
+        admin_password (str, optional): Admin password for verification when registering as admin
+        
+    Returns:
+        bool: True if registration successful, False otherwise
+    """
+    # Admin password for verification - in a real system, this would be stored securely
+    ADMIN_PASSWORD = "secure_admin_password"
+    
     mydb = create_db_connection()
     if mydb:
         cursor = mydb.cursor()
@@ -177,15 +191,27 @@ def register_user(username, password, client_public_key):
             
             hashed_password = hashlib.sha256(password.encode()).hexdigest()
             
-            # If it's the first user, make them an admin
-            role = 'admin' if is_first_user else 'regular'
+            # Determine role
+            if is_first_user:
+                # First user is always admin
+                role = 'admin'
+                log_activity(f"First user '{username}' being registered as administrator")
+            elif requested_role == 'admin' and admin_password == ADMIN_PASSWORD:
+                # Allow admin registration with correct password
+                role = 'admin'
+                log_activity(f"New admin user '{username}' being registered with admin password")
+            else:
+                # Default or invalid admin registration request
+                role = 'regular'
+                if requested_role == 'admin':
+                    log_activity(f"Admin registration for '{username}' rejected: Invalid admin password")
             
             cursor.execute("INSERT INTO users (username, password, public_key, role) VALUES (%s, %s, %s, %s)",
                            (username, hashed_password, client_public_key, role))
             user_id = cursor.lastrowid
             
-            # If it's the first user (admin), give them all permissions
-            if is_first_user:
+            # If it's an admin user, give them all permissions
+            if role == 'admin':
                 # Get all permission IDs
                 cursor.execute("SELECT id FROM permissions")
                 permissions = cursor.fetchall()
@@ -650,7 +676,7 @@ def get_all_users():
             cursor.close()
             mydb.close()
             return None
-    return None
+        return None
 
 
 # --- Client Handling ---
@@ -678,8 +704,11 @@ def handle_client(client_socket, client_address):
                         username = request.get('username')
                         password = request.get('password')
                         client_public_key = request.get('public_key')
+                        requested_role = request.get('role')
+                        admin_password = request.get('admin_password')
+                        
                         if username and password:
-                            if register_user(username, password, client_public_key):
+                            if register_user(username, password, client_public_key, requested_role, admin_password):
                                 response = {'status': 'success', 'message': 'Registration successful'}
                             else:
                                 response = {'status': 'error', 'message': 'Username already exists'}
