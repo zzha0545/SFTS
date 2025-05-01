@@ -396,6 +396,263 @@ def get_transfer_history(user_id):
         return None
 
 
+def get_file_id(filename, user_id=None):
+    """Retrieves the file ID based on filename.
+    
+    Args:
+        filename (str): The filename to look up
+        user_id (int, optional): If provided, only return files where this user is sender or recipient
+        
+    Returns:
+        int or None: The file ID if found, None otherwise
+    """
+    mydb = create_db_connection()
+    if mydb:
+        cursor = mydb.cursor()
+        try:
+            if user_id:
+                cursor.execute("""
+                    SELECT id FROM file_transfers 
+                    WHERE filename = %s AND (sender_id = %s OR recipient_id = %s)
+                """, (filename, user_id, user_id))
+            else:
+                cursor.execute("SELECT id FROM file_transfers WHERE filename = %s", (filename,))
+                
+            result = cursor.fetchone()
+            cursor.close()
+            mydb.close()
+            
+            if result:
+                return result[0]
+            else:
+                log_activity(f"Could not find file ID for filename '{filename}'")
+                return None
+        except mysql.connector.Error as err:
+            log_activity(f"Database error retrieving file ID: {err}")
+            cursor.close()
+            mydb.close()
+            return None
+    return None
+
+
+def check_file_permission(file_id, user_id, permission_type):
+    """Checks if a user has a specific permission for a file.
+    
+    Args:
+        file_id (int): The file ID
+        user_id (int): The user ID
+        permission_type (str): The permission type ('read', 'write', 'manage')
+        
+    Returns:
+        bool: True if the user has the permission, False otherwise
+    """
+    mydb = create_db_connection()
+    if mydb:
+        cursor = mydb.cursor()
+        try:
+            # Check if the user is the file owner (sender)
+            cursor.execute("""
+                SELECT sender_id FROM file_transfers WHERE id = %s
+            """, (file_id,))
+            result = cursor.fetchone()
+            
+            # If user is the file owner, they have all permissions
+            if result and result[0] == user_id:
+                cursor.close()
+                mydb.close()
+                return True
+                
+            # Check if the user is the recipient (has read permission by default)
+            if permission_type == 'read':
+                cursor.execute("""
+                    SELECT recipient_id FROM file_transfers WHERE id = %s
+                """, (file_id,))
+                result = cursor.fetchone()
+                if result and result[0] == user_id:
+                    cursor.close()
+                    mydb.close()
+                    return True
+            
+            # Check if the user has admin role
+            cursor.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+            role = cursor.fetchone()
+            if role and role[0] == 'admin':
+                cursor.close()
+                mydb.close()
+                return True
+                
+            # Check explicit file permission
+            cursor.execute("""
+                SELECT COUNT(*) FROM file_permissions 
+                WHERE file_id = %s AND user_id = %s AND permission_type = %s
+            """, (file_id, user_id, permission_type))
+            has_permission = cursor.fetchone()[0] > 0
+            
+            # Check public permission
+            if not has_permission:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM file_permissions 
+                    WHERE file_id = %s AND is_public = TRUE AND permission_type = %s
+                """, (file_id, permission_type))
+                has_public_permission = cursor.fetchone()[0] > 0
+                has_permission = has_permission or has_public_permission
+            
+            cursor.close()
+            mydb.close()
+            return has_permission
+            
+        except mysql.connector.Error as err:
+            log_activity(f"Error checking file permission: {err}")
+            cursor.close()
+            mydb.close()
+            return False
+    return False
+
+
+def set_file_permission(file_id, user_id, permission_type, target_user_id=None, is_public=False):
+    """Sets a permission for a file.
+    
+    Args:
+        file_id (int): The file ID
+        user_id (int): The ID of the user setting the permission (must be owner or have manage permission)
+        permission_type (str): The permission type ('read', 'write', 'manage')
+        target_user_id (int, optional): The user ID to grant permission to (None for public permission)
+        is_public (bool): Whether this is a public permission
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    # First check if the user has the right to manage this file
+    if not check_file_permission(file_id, user_id, 'manage'):
+        log_activity(f"User {user_id} attempted to set permissions on file {file_id} without manage permission")
+        return False
+        
+    mydb = create_db_connection()
+    if mydb:
+        cursor = mydb.cursor()
+        try:
+            # First remove any existing permission of this type for the target
+            if target_user_id:
+                cursor.execute("""
+                    DELETE FROM file_permissions 
+                    WHERE file_id = %s AND user_id = %s AND permission_type = %s
+                """, (file_id, target_user_id, permission_type))
+            elif is_public:
+                cursor.execute("""
+                    DELETE FROM file_permissions 
+                    WHERE file_id = %s AND user_id IS NULL AND permission_type = %s AND is_public = TRUE
+                """, (file_id, permission_type))
+                
+            # Now insert the new permission
+            cursor.execute("""
+                INSERT INTO file_permissions (file_id, user_id, permission_type, is_public)
+                VALUES (%s, %s, %s, %s)
+            """, (file_id, target_user_id, permission_type, is_public))
+            
+            mydb.commit()
+            cursor.close()
+            mydb.close()
+            
+            if target_user_id:
+                log_activity(f"User {user_id} granted {permission_type} permission on file {file_id} to user {target_user_id}")
+            else:
+                log_activity(f"User {user_id} set file {file_id} {permission_type} permission to public: {is_public}")
+                
+            return True
+            
+        except mysql.connector.Error as err:
+            log_activity(f"Error setting file permission: {err}")
+            cursor.close()
+            mydb.close()
+            return False
+    return False
+
+
+def remove_file_permission(file_id, user_id, permission_type, target_user_id=None, is_public=False):
+    """Removes a permission from a file.
+    
+    Args:
+        file_id (int): The file ID
+        user_id (int): The ID of the user removing the permission (must be owner or have manage permission)
+        permission_type (str): The permission type ('read', 'write', 'manage')
+        target_user_id (int, optional): The user ID to remove permission from (None for public permission)
+        is_public (bool): Whether this is a public permission
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    # First check if the user has the right to manage this file
+    if not check_file_permission(file_id, user_id, 'manage'):
+        log_activity(f"User {user_id} attempted to remove permissions on file {file_id} without manage permission")
+        return False
+        
+    mydb = create_db_connection()
+    if mydb:
+        cursor = mydb.cursor()
+        try:
+            # Remove the permission
+            if target_user_id:
+                cursor.execute("""
+                    DELETE FROM file_permissions 
+                    WHERE file_id = %s AND user_id = %s AND permission_type = %s
+                """, (file_id, target_user_id, permission_type))
+            elif is_public:
+                cursor.execute("""
+                    DELETE FROM file_permissions 
+                    WHERE file_id = %s AND user_id IS NULL AND permission_type = %s AND is_public = TRUE
+                """, (file_id, permission_type))
+                
+            mydb.commit()
+            cursor.close()
+            mydb.close()
+            
+            if target_user_id:
+                log_activity(f"User {user_id} removed {permission_type} permission on file {file_id} from user {target_user_id}")
+            else:
+                log_activity(f"User {user_id} removed public {permission_type} permission from file {file_id}")
+                
+            return True
+            
+        except mysql.connector.Error as err:
+            log_activity(f"Error removing file permission: {err}")
+            cursor.close()
+            mydb.close()
+            return False
+    return False
+
+
+def get_all_users():
+    """Retrieves a list of all users in the system.
+    
+    Returns:
+        list: List of dictionaries containing user information
+    """
+    mydb = create_db_connection()
+    if mydb:
+        cursor = mydb.cursor()
+        try:
+            cursor.execute("SELECT id, username, role FROM users ORDER BY username")
+            results = cursor.fetchall()
+            cursor.close()
+            mydb.close()
+            
+            users = []
+            for user_id, username, role in results:
+                users.append({
+                    'id': user_id,
+                    'username': username,
+                    'role': role
+                })
+            
+            return users
+        except mysql.connector.Error as err:
+            log_activity(f"Error retrieving users: {err}")
+            cursor.close()
+            mydb.close()
+            return None
+    return None
+
+
 # --- Client Handling ---
 def handle_client(client_socket, client_address):
     """Handles communication with a connected client."""
@@ -547,6 +804,35 @@ def handle_client(client_socket, client_address):
                                         """, (sender_id, recipient_id, filename, len(received_data), 'success',
                                             encrypted_key))
                                     mydb.commit()
+                                    
+                                    # Get the file ID for setting permissions
+                                    file_id = cursor.lastrowid
+                                    
+                                    # Set initial file permissions
+                                    # Owner (sender) gets all permissions
+                                    cursor.execute("""
+                                        INSERT INTO file_permissions (file_id, user_id, permission_type, is_public)
+                                        VALUES (%s, %s, %s, %s)
+                                    """, (file_id, sender_id, 'read', False))
+                                    
+                                    cursor.execute("""
+                                        INSERT INTO file_permissions (file_id, user_id, permission_type, is_public)
+                                        VALUES (%s, %s, %s, %s)
+                                    """, (file_id, sender_id, 'write', False))
+                                    
+                                    cursor.execute("""
+                                        INSERT INTO file_permissions (file_id, user_id, permission_type, is_public)
+                                        VALUES (%s, %s, %s, %s)
+                                    """, (file_id, sender_id, 'manage', False))
+                                    
+                                    # Recipient gets read permission
+                                    cursor.execute("""
+                                        INSERT INTO file_permissions (file_id, user_id, permission_type, is_public)
+                                        VALUES (%s, %s, %s, %s)
+                                    """, (file_id, recipient_id, 'read', False))
+                                    
+                                    mydb.commit()
+                                    log_activity(f"Initial file permissions set for file ID {file_id}")
                                 except mysql.connector.Error as err:
                                     log_activity(f"Database error: {err}")
                                     raise Exception(f"Database error: {err}")
@@ -596,9 +882,24 @@ def handle_client(client_socket, client_address):
                     elif action == 'download_file' and logged_in_user:
                         filename = request.get('filename')
                         recipient_username = logged_in_user
+                        user_id = get_user_id(logged_in_user)
 
                         if not filename:
                             response = {'status': 'error', 'message': 'Filename not provided'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Get file ID to check permissions
+                        file_id = get_file_id(filename)
+                        if not file_id:
+                            response = {'status': 'error', 'message': 'File not found'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Check if user has read permission
+                        if not check_file_permission(file_id, user_id, 'read'):
+                            log_activity(f"User {logged_in_user} (ID: {user_id}) attempted to download file '{filename}' without read permission")
+                            response = {'status': 'error', 'message': 'Access denied: You do not have permission to read this file'}
                             client_socket.send(json.dumps(response).encode(ENCODING))
                             continue
 
@@ -699,6 +1000,173 @@ def handle_client(client_socket, client_address):
                         response = {'status': 'success', 'message': 'Logged out successfully'}
                         client_socket.send(json.dumps(response).encode(ENCODING))
                         log_activity(f"Sent logout confirmation to {client_address}.")
+                        
+                    elif action == 'set_file_permission' and logged_in_user:
+                        filename = request.get('filename')
+                        permission_type = request.get('permission_type')
+                        target_username = request.get('target_username')
+                        is_public = request.get('is_public', False)
+                        
+                        # Input validation
+                        if not filename or not permission_type or (not target_username and not is_public):
+                            response = {'status': 'error', 'message': 'Missing required parameters'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Validate permission type
+                        if permission_type not in ['read', 'write', 'manage']:
+                            response = {'status': 'error', 'message': 'Invalid permission type'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                        
+                        # Get file ID
+                        file_id = get_file_id(filename)
+                        if not file_id:
+                            response = {'status': 'error', 'message': 'File not found'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Get user IDs
+                        user_id = get_user_id(logged_in_user)
+                        target_user_id = get_user_id(target_username) if target_username else None
+                        
+                        if target_username and not target_user_id:
+                            response = {'status': 'error', 'message': 'Target user not found'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Set permission
+                        if set_file_permission(file_id, user_id, permission_type, target_user_id, is_public):
+                            response = {'status': 'success', 'message': 'File permission set successfully'}
+                        else:
+                            response = {'status': 'error', 'message': 'Failed to set file permission'}
+                            
+                        client_socket.send(json.dumps(response).encode(ENCODING))
+                        
+                    elif action == 'remove_file_permission' and logged_in_user:
+                        filename = request.get('filename')
+                        permission_type = request.get('permission_type')
+                        target_username = request.get('target_username')
+                        is_public = request.get('is_public', False)
+                        
+                        # Input validation
+                        if not filename or not permission_type or (not target_username and not is_public):
+                            response = {'status': 'error', 'message': 'Missing required parameters'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Validate permission type
+                        if permission_type not in ['read', 'write', 'manage']:
+                            response = {'status': 'error', 'message': 'Invalid permission type'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                        
+                        # Get file ID
+                        file_id = get_file_id(filename)
+                        if not file_id:
+                            response = {'status': 'error', 'message': 'File not found'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Get user IDs
+                        user_id = get_user_id(logged_in_user)
+                        target_user_id = get_user_id(target_username) if target_username else None
+                        
+                        if target_username and not target_user_id:
+                            response = {'status': 'error', 'message': 'Target user not found'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Remove permission
+                        if remove_file_permission(file_id, user_id, permission_type, target_user_id, is_public):
+                            response = {'status': 'success', 'message': 'File permission removed successfully'}
+                        else:
+                            response = {'status': 'error', 'message': 'Failed to remove file permission'}
+                            
+                        client_socket.send(json.dumps(response).encode(ENCODING))
+                        
+                    elif action == 'get_file_permissions' and logged_in_user:
+                        filename = request.get('filename')
+                        
+                        if not filename:
+                            response = {'status': 'error', 'message': 'Filename not provided'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Get file ID
+                        file_id = get_file_id(filename)
+                        if not file_id:
+                            response = {'status': 'error', 'message': 'File not found'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Get user ID
+                        user_id = get_user_id(logged_in_user)
+                        
+                        # Check if user has permission to view permissions
+                        if not check_file_permission(file_id, user_id, 'manage'):
+                            response = {'status': 'error', 'message': 'Access denied: You do not have permission to view file permissions'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Get file permissions
+                        mydb = create_db_connection()
+                        if mydb:
+                            cursor = mydb.cursor()
+                            try:
+                                # Get user-specific permissions
+                                cursor.execute("""
+                                    SELECT u.username, fp.permission_type 
+                                    FROM file_permissions fp
+                                    JOIN users u ON fp.user_id = u.id
+                                    WHERE fp.file_id = %s AND fp.user_id IS NOT NULL
+                                """, (file_id,))
+                                user_permissions = cursor.fetchall()
+                                
+                                # Get public permissions
+                                cursor.execute("""
+                                    SELECT permission_type 
+                                    FROM file_permissions
+                                    WHERE file_id = %s AND is_public = TRUE
+                                """, (file_id,))
+                                public_permissions = cursor.fetchall()
+                                
+                                cursor.close()
+                                mydb.close()
+                                
+                                # Format permissions data
+                                permissions_data = {
+                                    'user_permissions': [{'username': row[0], 'permission': row[1]} for row in user_permissions],
+                                    'public_permissions': [row[0] for row in public_permissions]
+                                }
+                                
+                                response = {'status': 'success', 'permissions': permissions_data}
+                                
+                            except mysql.connector.Error as err:
+                                log_activity(f"Database error getting file permissions: {err}")
+                                response = {'status': 'error', 'message': 'Database error'}
+                                cursor.close()
+                                mydb.close()
+                        else:
+                            response = {'status': 'error', 'message': 'Database connection failed'}
+                            
+                        client_socket.send(json.dumps(response).encode(ENCODING))
+
+                    elif action == 'get_users' and logged_in_user:
+                        # Only admin users can get the user list
+                        user_id = get_user_id(logged_in_user)
+                        if not user_id or not check_user_permission(user_id, 'manage_users'):
+                            response = {'status': 'error', 'message': 'Access denied: You do not have permission to manage users'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        users = get_all_users()
+                        if users is not None:
+                            response = {'status': 'success', 'users': users}
+                        else:
+                            response = {'status': 'error', 'message': 'Failed to retrieve user list'}
+                            
+                        client_socket.send(json.dumps(response).encode(ENCODING))
 
                     else:
                         response = {'status': 'error', 'message': 'Invalid action or not logged in'}
