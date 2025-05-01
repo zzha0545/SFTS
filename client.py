@@ -193,6 +193,9 @@ class FileTransferClientGUI:
         self.notebook.add(self.history_frame, text='Transfer History')
         self.notebook.pack(expand=True, fill='both', padx=10, pady=10)
 
+        # Bind tab change event
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+
         self.create_auth_widgets()
         self.create_transfer_widgets()
         self.create_history_widgets()
@@ -1155,6 +1158,10 @@ class FileTransferClientGUI:
         change_role_button = ttk.Button(buttons_frame, text="Change User Role", command=self.change_user_role)
         change_role_button.pack(side='left', padx=5, pady=5)
         
+        # Delete user button (NEW)
+        delete_user_button = ttk.Button(buttons_frame, text="Delete User", command=self.delete_user)
+        delete_user_button.pack(side='left', padx=5, pady=5)
+        
         # Permissions management section
         permissions_frame = ttk.LabelFrame(self.admin_frame, text="User Permissions")
         permissions_frame.pack(padx=10, pady=10, fill='both', expand=True)
@@ -1180,9 +1187,225 @@ class FileTransferClientGUI:
         revoke_button = ttk.Button(perm_buttons_frame, text="Revoke Permission", command=self.revoke_permission)
         revoke_button.pack(side='left', padx=5, pady=5)
         
+        # NEW: All User Transfers Section
+        transfers_frame = ttk.LabelFrame(self.admin_frame, text="All User Transfers")
+        transfers_frame.pack(padx=10, pady=10, fill='both', expand=True)
+        
+        # Create transfers treeview
+        self.admin_transfers_tree = ttk.Treeview(
+            transfers_frame,
+            columns=('id', 'filename', 'sender', 'recipient', 'time', 'size', 'status'),
+            show='headings',
+            selectmode='browse'
+        )
+        self.admin_transfers_tree.heading('id', text='ID')
+        self.admin_transfers_tree.heading('filename', text='Filename')
+        self.admin_transfers_tree.heading('sender', text='Sender')
+        self.admin_transfers_tree.heading('recipient', text='Recipient')
+        self.admin_transfers_tree.heading('time', text='Time')
+        self.admin_transfers_tree.heading('size', text='Size (bytes)')
+        self.admin_transfers_tree.heading('status', text='Status')
+        
+        self.admin_transfers_tree.column('id', width=40)
+        self.admin_transfers_tree.column('filename', width=150)
+        self.admin_transfers_tree.column('sender', width=100)
+        self.admin_transfers_tree.column('recipient', width=100)
+        self.admin_transfers_tree.column('time', width=130)
+        self.admin_transfers_tree.column('size', width=80)
+        self.admin_transfers_tree.column('status', width=80)
+        
+        self.admin_transfers_tree.pack(expand=True, fill='both', padx=5, pady=5)
+        
+        # Scrollbar for transfers tree
+        transfers_scrollbar = ttk.Scrollbar(transfers_frame, orient='vertical', command=self.admin_transfers_tree.yview)
+        transfers_scrollbar.pack(side='right', fill='y')
+        self.admin_transfers_tree.configure(yscrollcommand=transfers_scrollbar.set)
+        
+        # Transfers management buttons
+        transfers_button_frame = ttk.Frame(transfers_frame)
+        transfers_button_frame.pack(fill='x', pady=5)
+        
+        get_all_transfers_button = ttk.Button(
+            transfers_button_frame, text="Get All Transfers", command=self.get_all_transfers
+        )
+        get_all_transfers_button.pack(side='left', padx=5, fill='x', expand=True)
+        
+        delete_transfer_button = ttk.Button(
+            transfers_button_frame, text="Delete Selected Transfer", command=self.delete_transfer
+        )
+        delete_transfer_button.pack(side='left', padx=5, fill='x', expand=True)
+        
+        # Filter options
+        filter_frame = ttk.Frame(transfers_frame)
+        filter_frame.pack(fill='x', pady=5)
+        
+        ttk.Label(filter_frame, text="Filter by User:").pack(side='left', padx=5)
+        self.filter_user_entry = ttk.Entry(filter_frame, width=15)
+        self.filter_user_entry.pack(side='left', padx=5)
+        
+        filter_button = ttk.Button(
+            filter_frame, text="Apply Filter", command=lambda: self.get_all_transfers(self.filter_user_entry.get())
+        )
+        filter_button.pack(side='left', padx=5)
+        
         # Load users immediately
         self.get_users()
         
+        # Load all transfers immediately as well
+        self.master.after(500, self.get_all_transfers)  # Short delay to ensure UI is ready
+        
+    def get_all_transfers(self, filter_username=None):
+        """Retrieves all transfers for admin view."""
+        if not self.logged_in or self.user_role != 'admin':
+            messagebox.showerror("Error", "Admin privileges required")
+            return
+        
+        print(f"Requesting all transfers with filter: {filter_username}")
+        self.status_label.config(text="Fetching all transfer records...")
+            
+        request = {
+            'action': 'get_all_transfers'
+        }
+        
+        # Add filter if provided
+        if filter_username:
+            request['filter_username'] = filter_username
+            
+        if self.send_request(request):
+            response = self.receive_response()
+            
+            if response and response.get('status') == 'success':
+                # Clear existing items
+                for item in self.admin_transfers_tree.get_children():
+                    self.admin_transfers_tree.delete(item)
+                    
+                # Populate with new data
+                transfers = response.get('transfers', [])
+                print(f"Received {len(transfers)} transfer records")
+                
+                for transfer in transfers:
+                    self.admin_transfers_tree.insert('', 'end', values=(
+                        transfer.get('id', ''),
+                        transfer.get('filename', ''),
+                        transfer.get('sender', ''),
+                        transfer.get('recipient', ''),
+                        transfer.get('transfer_time', ''),
+                        transfer.get('file_size', ''),
+                        transfer.get('status', '')
+                    ))
+                    
+                self.status_label.config(text=f"Retrieved {len(transfers)} transfer records")
+            else:
+                error_msg = response.get('message', "Failed to retrieve transfers") if response else "No response from server"
+                print(f"Error retrieving transfers: {error_msg}")
+                messagebox.showerror("Error", error_msg)
+                self.status_label.config(text=f"Error: {error_msg}")
+        else:
+            print("Failed to send get_all_transfers request")
+            self.status_label.config(text="Error: Failed to send request")
+
+    # When notebook tab is changed, load transfers if admin tab is selected
+    def on_tab_changed(self, event):
+        """Called when the notebook tab is changed"""
+        if not hasattr(self, 'notebook'):
+            return
+            
+        selected_tab = self.notebook.select()
+        if selected_tab and self.admin_frame and selected_tab == str(self.admin_frame):
+            # If admin tab is selected, refresh transfers
+            print("Admin tab selected, refreshing transfers")
+            if self.logged_in and self.user_role == 'admin':
+                self.get_all_transfers()
+
+    def delete_transfer(self):
+        """Deletes the selected transfer (admin only)."""
+        if not self.logged_in or self.user_role != 'admin':
+            messagebox.showerror("Error", "Admin privileges required")
+            return
+            
+        selected = self.admin_transfers_tree.selection()
+        if not selected:
+            messagebox.showerror("Error", "Please select a transfer to delete")
+            return
+            
+        transfer_values = self.admin_transfers_tree.item(selected, 'values')
+        transfer_id = transfer_values[0]
+        filename = transfer_values[1]
+        
+        # Confirm deletion
+        confirm = messagebox.askyesno(
+            "Confirm Deletion", 
+            f"Are you sure you want to delete the transfer record for '{filename}'?\n\nThis operation cannot be undone."
+        )
+        
+        if not confirm:
+            return
+            
+        request = {
+            'action': 'delete_transfer',
+            'transfer_id': transfer_id
+        }
+        
+        if self.send_request(request):
+            response = self.receive_response()
+            
+            if response and response.get('status') == 'success':
+                messagebox.showinfo("Success", "Transfer record deleted successfully")
+                # Refresh the list
+                self.get_all_transfers()
+            else:
+                messagebox.showerror("Error", response.get('message', "Failed to delete transfer"))
+    
+    def delete_user(self):
+        """Deletes the selected user and their records (admin only)."""
+        if not self.logged_in or self.user_role != 'admin':
+            messagebox.showerror("Error", "Admin privileges required")
+            return
+            
+        selected = self.users_tree.selection()
+        if not selected:
+            messagebox.showerror("Error", "Please select a user to delete")
+            return
+            
+        user_values = self.users_tree.item(selected, 'values')
+        username = user_values[0]
+        user_id = user_values[2]
+        
+        # Don't allow deleting own account
+        if username == self.logged_in_user:
+            messagebox.showerror("Error", "You cannot delete your own account")
+            return
+            
+        # Confirm deletion with more serious warning
+        confirm = messagebox.askyesno(
+            "Confirm User Deletion", 
+            f"WARNING: You are about to delete user '{username}' and ALL their transfer records.\n\n"
+            f"This operation CANNOT be undone and may impact other users' access to shared files.\n\n"
+            f"Are you absolutely sure you want to continue?",
+            icon='warning'
+        )
+        
+        if not confirm:
+            return
+            
+        request = {
+            'action': 'delete_user',
+            'target_user_id': user_id
+        }
+        
+        if self.send_request(request):
+            response = self.receive_response()
+            
+            if response and response.get('status') == 'success':
+                messagebox.showinfo("Success", f"User '{username}' and all their records deleted successfully")
+                # Refresh the lists
+                self.get_users()
+                if hasattr(self, 'admin_transfers_tree'):
+                    self.get_all_transfers()
+                self.get_transfer_history()  # Update regular history view as well
+            else:
+                messagebox.showerror("Error", response.get('message', "Failed to delete user"))
+
     def get_users(self):
         """Retrieves the list of users from the server."""
         if not self.logged_in or self.user_role != 'admin':

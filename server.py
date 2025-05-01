@@ -559,20 +559,16 @@ def check_file_permission(file_id, user_id, permission_type):
                 mydb.close()
                 return True
                 
-            # Check recipient permissions (recipients always have read access)
+            # Check recipient status - but don't automatically grant read permission
+            # Instead, check for explicit permission in the file_permissions table
             cursor.execute("""
                 SELECT recipient_id FROM file_transfers
                 WHERE id = %s
             """, (file_id,))
             recipient_data = cursor.fetchone()
+            recipient_id = recipient_data[0] if recipient_data else None
             
-            # If user is the recipient and asking for read permission, grant it
-            if recipient_data and recipient_data[0] == user_id and permission_type == 'read':
-                cursor.close()
-                mydb.close()
-                return True
-                
-            # Check explicit file permissions
+            # Check explicit file permissions only
             cursor.execute("""
                 SELECT COUNT(*) FROM file_permissions
                 WHERE file_id = %s AND 
@@ -581,6 +577,11 @@ def check_file_permission(file_id, user_id, permission_type):
             """, (file_id, user_id, permission_type))
             
             has_permission = cursor.fetchone()[0] > 0
+            
+            # Log detailed permission check results
+            if user_id == recipient_id:
+                log_activity(f"Permission check for recipient (user_id {user_id}): {permission_type} = {has_permission}")
+            
             cursor.close()
             mydb.close()
             return has_permission
@@ -940,6 +941,235 @@ def revoke_permission(user_id, target_user_id, permission_name):
         cursor.close()
         mydb.close()
         return False
+
+
+def get_all_transfers(filter_username=None):
+    """Retrieves all file transfers (admin only).
+    
+    Args:
+        filter_username (str, optional): Filter transfers by username
+        
+    Returns:
+        list: List of all transfer records
+    """
+    mydb = create_db_connection()
+    if not mydb:
+        log_activity("Database connection failed when retrieving all transfers")
+        return None
+        
+    cursor = mydb.cursor()
+    try:
+        # Base query
+        query = """
+            SELECT ft.id, ft.filename, s.username AS sender, r.username AS recipient, 
+                   ft.transfer_time, ft.file_size, ft.status
+            FROM file_transfers ft
+            JOIN users s ON ft.sender_id = s.id
+            JOIN users r ON ft.recipient_id = r.id
+        """
+        
+        params = []
+        
+        # Add filter if provided
+        if filter_username:
+            query += " WHERE s.username LIKE %s OR r.username LIKE %s"
+            filter_pattern = f"%{filter_username}%"
+            params = [filter_pattern, filter_pattern]
+            
+        # Add ordering
+        query += " ORDER BY ft.transfer_time DESC"
+        
+        log_activity(f"Executing transfer query: {query} with params: {params}")
+        
+        # Execute query
+        cursor.execute(query, params)
+        transfers = cursor.fetchall()
+        
+        log_activity(f"Query returned {len(transfers)} records")
+        
+        # Format results
+        result = []
+        for transfer in transfers:
+            result.append({
+                'id': transfer[0],
+                'filename': transfer[1],
+                'sender': transfer[2],
+                'recipient': transfer[3],
+                'transfer_time': str(transfer[4]),
+                'file_size': transfer[5],
+                'status': transfer[6]
+            })
+            
+        log_activity(f"Retrieved {len(result)} transfer records. Filter: {filter_username if filter_username else 'None'}")
+        return result
+        
+    except Exception as err:
+        log_activity(f"Error retrieving all transfers: {err}")
+        return None
+    finally:
+        cursor.close()
+        mydb.close()
+
+
+def delete_transfer(transfer_id, admin_id):
+    """Deletes a transfer record and its associated file permissions (admin only).
+    
+    Args:
+        transfer_id (int): The ID of the transfer to delete
+        admin_id (int): The ID of the admin user making the request
+        
+    Returns:
+        bool: True if deletion was successful, False otherwise
+    """
+    # Validate admin permissions
+    if not check_user_permission(admin_id, 'manage_files'):
+        log_activity(f"User ID {admin_id} attempted to delete transfer {transfer_id} without permission")
+        return False
+        
+    mydb = create_db_connection()
+    if not mydb:
+        log_activity(f"Database connection failed when deleting transfer {transfer_id}")
+        return False
+        
+    cursor = mydb.cursor()
+    try:
+        # Start transaction
+        mydb.begin()
+        
+        # First check if the transfer exists
+        cursor.execute("SELECT filename FROM file_transfers WHERE id = %s", (transfer_id,))
+        result = cursor.fetchone()
+        
+        if not result:
+            log_activity(f"Transfer ID {transfer_id} not found")
+            mydb.rollback()
+            return False
+            
+        filename = result[0]
+        
+        # Delete file permissions first (due to foreign key constraint)
+        cursor.execute("DELETE FROM file_permissions WHERE file_id = %s", (transfer_id,))
+        
+        # Then delete the transfer record
+        cursor.execute("DELETE FROM file_transfers WHERE id = %s", (transfer_id,))
+        
+        # Find and delete the encrypted file if it exists
+        deleted_file = False
+        try:
+            for fname in os.listdir("received_files"):
+                if fname.endswith(f"_{filename}.enc"):
+                    file_path = os.path.join("received_files", fname)
+                    os.remove(file_path)
+                    deleted_file = True
+                    break
+        except Exception as e:
+            log_activity(f"Error attempting to delete file: {e}")
+            # Continue anyway - we can delete the database record even if file deletion fails
+        
+        mydb.commit()
+        log_activity(f"Admin {admin_id} deleted transfer {transfer_id} ({filename}). File deleted: {deleted_file}")
+        return True
+        
+    except Exception as err:
+        mydb.rollback()
+        log_activity(f"Error deleting transfer {transfer_id}: {err}")
+        return False
+    finally:
+        cursor.close()
+        mydb.close()
+
+
+def delete_user(admin_id, target_user_id):
+    """Deletes a user and all their associated records (admin only).
+    
+    Args:
+        admin_id (int): The ID of the admin making the request
+        target_user_id (int): The ID of the user to delete
+        
+    Returns:
+        bool: True if deletion was successful, False otherwise
+    """
+    # Prevent self-deletion
+    if admin_id == target_user_id:
+        log_activity(f"Admin {admin_id} attempted to delete own account")
+        return False
+        
+    # Validate admin permissions
+    if not check_user_permission(admin_id, 'manage_users'):
+        log_activity(f"User ID {admin_id} attempted to delete user {target_user_id} without permission")
+        return False
+        
+    mydb = create_db_connection()
+    if not mydb:
+        log_activity(f"Database connection failed when deleting user {target_user_id}")
+        return False
+        
+    cursor = mydb.cursor()
+    try:
+        # Start transaction
+        mydb.begin()
+        
+        # First verify user exists and get their username
+        cursor.execute("SELECT username FROM users WHERE id = %s", (target_user_id,))
+        result = cursor.fetchone()
+        
+        if not result:
+            log_activity(f"User ID {target_user_id} not found")
+            mydb.rollback()
+            return False
+            
+        username = result[0]
+        
+        # Get all transfers where user is sender or recipient
+        cursor.execute("""
+            SELECT id, filename FROM file_transfers 
+            WHERE sender_id = %s OR recipient_id = %s
+        """, (target_user_id, target_user_id))
+        
+        transfers = cursor.fetchall()
+        transfer_ids = [t[0] for t in transfers]
+        filenames = [t[1] for t in transfers]
+        
+        # Delete associated file permissions
+        if transfer_ids:
+            placeholders = ', '.join(['%s'] * len(transfer_ids))
+            cursor.execute(f"DELETE FROM file_permissions WHERE file_id IN ({placeholders})", transfer_ids)
+            
+            # Delete the transfers
+            cursor.execute(f"DELETE FROM file_transfers WHERE id IN ({placeholders})", transfer_ids)
+            
+        # Delete user permissions
+        cursor.execute("DELETE FROM user_permissions WHERE user_id = %s", (target_user_id,))
+        
+        # Delete user file permissions
+        cursor.execute("DELETE FROM file_permissions WHERE user_id = %s", (target_user_id,))
+        
+        # Finally, delete the user
+        cursor.execute("DELETE FROM users WHERE id = %s", (target_user_id,))
+        
+        # Try to delete encrypted files
+        for filename in filenames:
+            try:
+                for fname in os.listdir("received_files"):
+                    if fname.endswith(f"_{filename}.enc"):
+                        file_path = os.path.join("received_files", fname)
+                        os.remove(file_path)
+                        break
+            except Exception as e:
+                log_activity(f"Error deleting file for {filename}: {e}")
+                # Continue anyway
+        
+        mydb.commit()
+        log_activity(f"Admin {admin_id} deleted user {username} (ID: {target_user_id}) and {len(transfer_ids)} associated transfers")
+        return True
+        
+    except Exception as err:
+        mydb.rollback()
+        log_activity(f"Error deleting user {target_user_id}: {err}")
+        return False
+    finally:
+        cursor.close()
+        mydb.close()
 
 
 # --- Client Handling ---
@@ -1498,6 +1728,74 @@ def handle_client(client_socket, client_address):
                             response = {'status': 'success', 'message': f"Permission '{permission_name}' revoked from {target_username}"}
                         else:
                             response = {'status': 'error', 'message': 'Failed to revoke permission'}
+                            
+                        client_socket.send(json.dumps(response).encode(ENCODING))
+
+                    elif action == 'get_all_transfers' and logged_in_user:
+                        # Admin only - get all file transfers
+                        user_id = get_user_id(logged_in_user)
+                        
+                        log_activity(f"User {logged_in_user} (ID: {user_id}) requesting all transfers")
+                        
+                        # Verify admin permission
+                        has_permission = check_user_permission(user_id, 'manage_files')
+                        log_activity(f"User {logged_in_user} has manage_files permission: {has_permission}")
+                        
+                        if not user_id or not has_permission:
+                            response = {'status': 'error', 'message': 'Access denied: Admin privileges required'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            log_activity(f"Access denied for user {logged_in_user} to get all transfers")
+                            continue
+                            
+                        # Get optional filter
+                        filter_username = request.get('filter_username')
+                        
+                        # Get all transfers
+                        all_transfers = get_all_transfers(filter_username)
+                        
+                        if all_transfers is not None:
+                            response = {'status': 'success', 'transfers': all_transfers}
+                            log_activity(f"Sending {len(all_transfers)} transfer records to admin {logged_in_user}")
+                        else:
+                            response = {'status': 'error', 'message': 'Failed to retrieve transfers'}
+                            log_activity(f"Failed to retrieve transfers for admin {logged_in_user}")
+                            
+                        client_socket.send(json.dumps(response).encode(ENCODING))
+                        log_activity(f"Response sent to admin {logged_in_user}")
+                        
+                    elif action == 'delete_transfer' and logged_in_user:
+                        # Admin only - delete a transfer record
+                        user_id = get_user_id(logged_in_user)
+                        transfer_id = request.get('transfer_id')
+                        
+                        if not user_id or not transfer_id:
+                            response = {'status': 'error', 'message': 'Missing required parameters'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Try to delete the transfer
+                        if delete_transfer(transfer_id, user_id):
+                            response = {'status': 'success', 'message': 'Transfer deleted successfully'}
+                        else:
+                            response = {'status': 'error', 'message': 'Failed to delete transfer. Check permissions.'}
+                            
+                        client_socket.send(json.dumps(response).encode(ENCODING))
+                        
+                    elif action == 'delete_user' and logged_in_user:
+                        # Admin only - delete a user and their records
+                        admin_id = get_user_id(logged_in_user)
+                        target_user_id = request.get('target_user_id')
+                        
+                        if not admin_id or not target_user_id:
+                            response = {'status': 'error', 'message': 'Missing required parameters'}
+                            client_socket.send(json.dumps(response).encode(ENCODING))
+                            continue
+                            
+                        # Try to delete the user
+                        if delete_user(admin_id, target_user_id):
+                            response = {'status': 'success', 'message': 'User deleted successfully'}
+                        else:
+                            response = {'status': 'error', 'message': 'Failed to delete user. Check permissions.'}
                             
                         client_socket.send(json.dumps(response).encode(ENCODING))
 
